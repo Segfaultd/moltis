@@ -143,11 +143,14 @@ impl moltis_tools::location::LocationRequester for GatewayLocationRequester {
         {
             let mut inner_w = self.state.inner.write().await;
             let invokes = &mut inner_w.pending_invokes;
-            invokes.insert(request_id.clone(), crate::state::PendingInvoke {
-                request_id: request_id.clone(),
-                sender: tx,
-                created_at: std::time::Instant::now(),
-            });
+            invokes.insert(
+                request_id.clone(),
+                crate::state::PendingInvoke {
+                    request_id: request_id.clone(),
+                    sender: tx,
+                    created_at: std::time::Instant::now(),
+                },
+            );
         }
 
         // Wait up to 30 seconds for the user to grant/deny permission.
@@ -261,13 +264,14 @@ impl moltis_tools::location::LocationRequester for GatewayLocationRequester {
         let (tx, rx) = tokio::sync::oneshot::channel();
         {
             let mut inner = self.state.inner.write().await;
-            inner
-                .pending_invokes
-                .insert(pending_key.clone(), crate::state::PendingInvoke {
+            inner.pending_invokes.insert(
+                pending_key.clone(),
+                crate::state::PendingInvoke {
                     request_id: pending_key.clone(),
                     sender: tx,
                     created_at: std::time::Instant::now(),
-                });
+                },
+            );
         }
 
         // Wait up to 60 seconds — user needs to navigate Telegram's UI.
@@ -1240,16 +1244,17 @@ pub async fn start_gateway(
                     "sse" => moltis_mcp::registry::TransportType::Sse,
                     _ => moltis_mcp::registry::TransportType::Stdio,
                 };
-                merged
-                    .servers
-                    .insert(name.clone(), moltis_mcp::McpServerConfig {
+                merged.servers.insert(
+                    name.clone(),
+                    moltis_mcp::McpServerConfig {
                         command: entry.command.clone(),
                         args: entry.args.clone(),
                         env: entry.env.clone(),
                         enabled: entry.enabled,
                         transport,
                         url: entry.url.clone(),
-                    });
+                    },
+                );
             }
         }
         mcp_configured_count = merged.servers.values().filter(|s| s.enabled).count();
@@ -1918,7 +1923,7 @@ pub async fn start_gateway(
 
     // Session service is wired after hook registry is built (below).
 
-    // Wire channel store and Telegram channel service.
+    // Wire channel store and channel services (Telegram + optional Slack).
     {
         use moltis_channels::store::ChannelStore;
 
@@ -1935,7 +1940,8 @@ pub async fn start_gateway(
 
         // Start channels from config file (these take precedence).
         let tg_accounts = &config.channels.telegram;
-        let mut started: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut started: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         for (account_id, account_config) in tg_accounts {
             if let Err(e) = tg_plugin
                 .start_account(account_id, account_config.clone())
@@ -1943,7 +1949,26 @@ pub async fn start_gateway(
             {
                 tracing::warn!(account_id, "failed to start telegram account: {e}");
             } else {
-                started.insert(account_id.clone());
+                started.insert(("telegram".to_string(), account_id.clone()));
+            }
+        }
+
+        #[cfg(feature = "slack")]
+        let mut slack_plugin = moltis_slack::SlackPlugin::new()
+            .with_message_log(Arc::clone(&message_log))
+            .with_event_sink(Arc::new(
+                crate::channel_events::GatewayChannelEventSink::new(Arc::clone(&deferred_state)),
+            ));
+
+        #[cfg(feature = "slack")]
+        for (account_id, account_config) in &config.channels.slack {
+            if let Err(e) = slack_plugin
+                .start_account(account_id, account_config.clone())
+                .await
+            {
+                tracing::warn!(account_id, "failed to start slack account: {e}");
+            } else {
+                started.insert(("slack".to_string(), account_id.clone()));
             }
         }
 
@@ -1952,7 +1977,7 @@ pub async fn start_gateway(
             Ok(stored) => {
                 info!("{} stored channel(s) found in database", stored.len());
                 for ch in stored {
-                    if started.contains(&ch.account_id) {
+                    if started.contains(&(ch.channel_type.clone(), ch.account_id.clone())) {
                         info!(
                             account_id = ch.account_id,
                             "skipping stored channel (already started from config)"
@@ -1964,13 +1989,38 @@ pub async fn start_gateway(
                         channel_type = ch.channel_type,
                         "starting stored channel"
                     );
-                    if let Err(e) = tg_plugin.start_account(&ch.account_id, ch.config).await {
-                        tracing::warn!(
-                            account_id = ch.account_id,
-                            "failed to start stored telegram account: {e}"
-                        );
-                    } else {
-                        started.insert(ch.account_id);
+                    match ch.channel_type.as_str() {
+                        "telegram" => {
+                            if let Err(e) = tg_plugin.start_account(&ch.account_id, ch.config).await
+                            {
+                                tracing::warn!(
+                                    account_id = ch.account_id,
+                                    "failed to start stored telegram account: {e}"
+                                );
+                            } else {
+                                started.insert(("telegram".to_string(), ch.account_id));
+                            }
+                        },
+                        #[cfg(feature = "slack")]
+                        "slack" => {
+                            if let Err(e) =
+                                slack_plugin.start_account(&ch.account_id, ch.config).await
+                            {
+                                tracing::warn!(
+                                    account_id = ch.account_id,
+                                    "failed to start stored slack account: {e}"
+                                );
+                            } else {
+                                started.insert(("slack".to_string(), ch.account_id));
+                            }
+                        },
+                        _ => {
+                            tracing::warn!(
+                                account_id = ch.account_id,
+                                channel_type = ch.channel_type,
+                                "unsupported stored channel type"
+                            );
+                        },
                     }
                 }
             },
@@ -1986,9 +2036,16 @@ pub async fn start_gateway(
         // Grab shared outbound before moving tg_plugin into the channel service.
         let tg_outbound = tg_plugin.shared_outbound();
         services = services.with_channel_outbound(tg_outbound);
+        #[cfg(feature = "slack")]
+        {
+            let slack_outbound = slack_plugin.shared_outbound();
+            services = services.with_channel_outbound(slack_outbound);
+        }
 
         services.channel = Arc::new(crate::channel::LiveChannelService::new(
             tg_plugin,
+            #[cfg(feature = "slack")]
+            slack_plugin,
             channel_store,
             Arc::clone(&message_log),
             Arc::clone(&session_metadata),
@@ -3073,10 +3130,15 @@ pub async fn start_gateway(
                         }
                     };
                     if changed && let Ok(payload) = serde_json::to_value(&next) {
-                        broadcast(&update_state, "update.available", payload, BroadcastOpts {
-                            drop_if_slow: true,
-                            ..Default::default()
-                        })
+                        broadcast(
+                            &update_state,
+                            "update.available",
+                            payload,
+                            BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            },
+                        )
                         .await;
                     }
                 },
@@ -3139,12 +3201,15 @@ pub async fn start_gateway(
                         .by_provider
                         .iter()
                         .map(|(name, metrics)| {
-                            (name.clone(), moltis_metrics::ProviderTokens {
-                                input_tokens: metrics.input_tokens,
-                                output_tokens: metrics.output_tokens,
-                                completions: metrics.completions,
-                                errors: metrics.errors,
-                            })
+                            (
+                                name.clone(),
+                                moltis_metrics::ProviderTokens {
+                                    input_tokens: metrics.input_tokens,
+                                    output_tokens: metrics.output_tokens,
+                                    completions: metrics.completions,
+                                    errors: metrics.errors,
+                                },
+                            )
                         })
                         .collect();
 

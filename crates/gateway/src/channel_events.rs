@@ -72,10 +72,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     return;
                 },
             };
-            broadcast(state, "channel", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "channel",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
         }
     }
@@ -108,10 +113,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                 "sessionKey": &session_key,
                 "messageIndex": msg_index,
             });
-            broadcast(state, "chat", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "chat",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
 
             // Register the reply target so the chat "final" broadcast can
@@ -139,7 +149,10 @@ impl ChannelEventSink for GatewayChannelEventSink {
                         .await;
                     let n = existing.len() + 1;
                     let _ = session_meta
-                        .upsert(&session_key, Some(format!("Telegram {n}")))
+                        .upsert(
+                            &session_key,
+                            Some(format!("{} {n}", reply_to.channel_type.as_str())),
+                        )
                         .await;
                 }
                 session_meta
@@ -336,10 +349,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     return;
                 },
             };
-            broadcast(state, "channel", payload, BroadcastOpts {
-                drop_if_slow: true,
-                ..Default::default()
-            })
+            broadcast(
+                state,
+                "channel",
+                payload,
+                BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                },
+            )
             .await;
         } else {
             warn!("request_disable_account: gateway not ready");
@@ -541,10 +559,15 @@ impl ChannelEventSink for GatewayChannelEventSink {
             "messageIndex": msg_index,
             "hasAttachments": true,
         });
-        broadcast(state, "chat", payload, BroadcastOpts {
-            drop_if_slow: true,
-            ..Default::default()
-        })
+        broadcast(
+            state,
+            "chat",
+            payload,
+            BroadcastOpts {
+                drop_if_slow: true,
+                ..Default::default()
+            },
+        )
         .await;
 
         // Register the reply target
@@ -568,7 +591,10 @@ impl ChannelEventSink for GatewayChannelEventSink {
                     .await;
                 let n = existing.len() + 1;
                 let _ = session_meta
-                    .upsert(&session_key, Some(format!("Telegram {n}")))
+                    .upsert(
+                        &session_key,
+                        Some(format!("{} {n}", reply_to.channel_type.as_str())),
+                    )
                     .await;
             }
             session_meta
@@ -730,7 +756,10 @@ impl ChannelEventSink for GatewayChannelEventSink {
 
                 // Create the new session entry with channel binding.
                 session_metadata
-                    .upsert(&new_key, Some(format!("Telegram {n}")))
+                    .upsert(
+                        &new_key,
+                        Some(format!("{} {n}", reply_to.channel_type.as_str())),
+                    )
                     .await
                     .map_err(|e| anyhow!("failed to create session: {e}"))?;
                 session_metadata

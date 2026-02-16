@@ -2,6 +2,7 @@
 //! Each trait has a `Noop` implementation that returns empty/default responses,
 //! allowing the gateway to run standalone before domain crates are wired in.
 
+use moltis_common::types::ReplyPayload;
 use {
     async_trait::async_trait,
     moltis_channels::ChannelOutbound,
@@ -2094,8 +2095,8 @@ pub struct GatewayServices {
     pub provider_setup: Arc<dyn ProviderSetupService>,
     pub project: Arc<dyn ProjectService>,
     pub local_llm: Arc<dyn LocalLlmService>,
-    /// Optional channel outbound for sending replies back to channels.
-    channel_outbound: Option<Arc<dyn ChannelOutbound>>,
+    /// Optional channel outbounds for sending replies back to channels.
+    channel_outbounds: Vec<Arc<dyn ChannelOutbound>>,
     /// Optional session metadata for cross-service access (e.g. channel binding).
     pub session_metadata: Option<Arc<moltis_sessions::metadata::SqliteSessionMetadata>>,
     /// Optional session store for message-index lookups (e.g. deduplication).
@@ -2126,12 +2127,20 @@ impl GatewayServices {
     }
 
     pub fn with_channel_outbound(mut self, outbound: Arc<dyn ChannelOutbound>) -> Self {
-        self.channel_outbound = Some(outbound);
+        self.channel_outbounds.push(outbound);
         self
     }
 
     pub fn channel_outbound_arc(&self) -> Option<Arc<dyn ChannelOutbound>> {
-        self.channel_outbound.clone()
+        if self.channel_outbounds.is_empty() {
+            return None;
+        }
+        if self.channel_outbounds.len() == 1 {
+            return self.channel_outbounds.first().cloned();
+        }
+        Some(Arc::new(CompositeChannelOutbound {
+            outbounds: self.channel_outbounds.clone(),
+        }))
     }
 
     /// Create a service bundle with all noop implementations.
@@ -2159,7 +2168,7 @@ impl GatewayServices {
             provider_setup: Arc::new(NoopProviderSetupService),
             project: Arc::new(NoopProjectService),
             local_llm: Arc::new(NoopLocalLlmService),
-            channel_outbound: None,
+            channel_outbounds: Vec::new(),
             session_metadata: None,
             session_store: None,
             session_share_store: None,
@@ -2207,6 +2216,175 @@ impl GatewayServices {
     pub fn with_stt(mut self, stt: Arc<dyn crate::voice::SttService>) -> Self {
         self.stt = stt;
         self
+    }
+}
+
+struct CompositeChannelOutbound {
+    outbounds: Vec<Arc<dyn ChannelOutbound>>,
+}
+
+#[async_trait]
+impl ChannelOutbound for CompositeChannelOutbound {
+    async fn send_text(
+        &self,
+        account_id: &str,
+        to: &str,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut last_error: Option<anyhow::Error> = None;
+        for outbound in &self.outbounds {
+            match outbound.send_text(account_id, to, text, reply_to).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if e.to_string().contains("unknown account") {
+                        continue;
+                    }
+                    last_error = Some(e);
+                    break;
+                },
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+        Err(anyhow::anyhow!("unknown account: {account_id}"))
+    }
+
+    async fn send_media(
+        &self,
+        account_id: &str,
+        to: &str,
+        payload: &ReplyPayload,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut last_error: Option<anyhow::Error> = None;
+        for outbound in &self.outbounds {
+            match outbound.send_media(account_id, to, payload, reply_to).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if e.to_string().contains("unknown account") {
+                        continue;
+                    }
+                    last_error = Some(e);
+                    break;
+                },
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+        Err(anyhow::anyhow!("unknown account: {account_id}"))
+    }
+
+    async fn send_typing(&self, account_id: &str, to: &str) -> anyhow::Result<()> {
+        let mut last_error: Option<anyhow::Error> = None;
+        for outbound in &self.outbounds {
+            match outbound.send_typing(account_id, to).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if e.to_string().contains("unknown account") {
+                        continue;
+                    }
+                    last_error = Some(e);
+                    break;
+                },
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+        Err(anyhow::anyhow!("unknown account: {account_id}"))
+    }
+
+    async fn send_text_with_suffix(
+        &self,
+        account_id: &str,
+        to: &str,
+        text: &str,
+        suffix_html: &str,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut last_error: Option<anyhow::Error> = None;
+        for outbound in &self.outbounds {
+            match outbound
+                .send_text_with_suffix(account_id, to, text, suffix_html, reply_to)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if e.to_string().contains("unknown account") {
+                        continue;
+                    }
+                    last_error = Some(e);
+                    break;
+                },
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+        Err(anyhow::anyhow!("unknown account: {account_id}"))
+    }
+
+    async fn send_text_silent(
+        &self,
+        account_id: &str,
+        to: &str,
+        text: &str,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut last_error: Option<anyhow::Error> = None;
+        for outbound in &self.outbounds {
+            match outbound
+                .send_text_silent(account_id, to, text, reply_to)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if e.to_string().contains("unknown account") {
+                        continue;
+                    }
+                    last_error = Some(e);
+                    break;
+                },
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+        Err(anyhow::anyhow!("unknown account: {account_id}"))
+    }
+
+    async fn send_location(
+        &self,
+        account_id: &str,
+        to: &str,
+        latitude: f64,
+        longitude: f64,
+        title: Option<&str>,
+        reply_to: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let mut last_error: Option<anyhow::Error> = None;
+        for outbound in &self.outbounds {
+            match outbound
+                .send_location(account_id, to, latitude, longitude, title, reply_to)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if e.to_string().contains("unknown account") {
+                        continue;
+                    }
+                    last_error = Some(e);
+                    break;
+                },
+            }
+        }
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+        Err(anyhow::anyhow!("unknown account: {account_id}"))
     }
 }
 

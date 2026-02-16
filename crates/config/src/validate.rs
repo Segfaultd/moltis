@@ -277,10 +277,13 @@ fn build_schema_map() -> KnownKeys {
                 ("update_repository_url", Leaf),
             ])),
         ),
-        ("providers", MapWithFields {
-            value: Box::new(provider_entry()),
-            fields: HashMap::from([("offered", Array(Box::new(Leaf)))]),
-        }),
+        (
+            "providers",
+            MapWithFields {
+                value: Box::new(provider_entry()),
+                fields: HashMap::from([("offered", Array(Box::new(Leaf)))]),
+            },
+        ),
         (
             "chat",
             Struct(HashMap::from([
@@ -307,7 +310,10 @@ fn build_schema_map() -> KnownKeys {
         ),
         (
             "channels",
-            Struct(HashMap::from([("telegram", Map(Box::new(Leaf)))])),
+            Struct(HashMap::from([
+                ("telegram", Map(Box::new(Leaf))),
+                ("slack", Map(Box::new(Leaf))),
+            ])),
         ),
         (
             "tls",

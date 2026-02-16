@@ -1,0 +1,34 @@
+[package]
+edition.workspace = true
+name              = "moltis-slack"
+version.workspace = true
+
+[dependencies]
+anyhow            = { workspace = true }
+async-trait       = { workspace = true }
+futures           = { workspace = true }
+moltis-auto-reply = { workspace = true }
+moltis-channels   = { workspace = true }
+moltis-common     = { workspace = true }
+moltis-media      = { workspace = true }
+moltis-metrics    = { optional = true, workspace = true }
+reqwest           = { workspace = true }
+secrecy           = { workspace = true }
+serde             = { workspace = true }
+serde_json        = { workspace = true }
+slack-morphism    = { workspace = true }
+tokio             = { workspace = true }
+tokio-tungstenite = { workspace = true }
+tokio-util        = { workspace = true }
+tracing           = { optional = true, workspace = true }
+
+[features]
+default = ["tracing"]
+metrics = ["dep:moltis-metrics"]
+tracing = ["dep:tracing"]
+
+[dev-dependencies]
+rstest = { workspace = true }
+
+[lints]
+workspace = true

@@ -4795,6 +4795,21 @@ fn format_logbook_html(entries: &[String]) -> String {
     html
 }
 
+/// Format status log entries as plain text (for channels that don't support
+/// Telegram HTML features like expandable blockquotes).
+fn format_logbook_text(entries: &[String]) -> String {
+    if entries.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("Activity log\n");
+    for entry in entries {
+        text.push_str("• ");
+        text.push_str(entry);
+        text.push('\n');
+    }
+    text
+}
+
 async fn deliver_channel_replies_to_targets(
     outbound: Arc<dyn moltis_channels::plugin::ChannelOutbound>,
     targets: Vec<moltis_channels::ChannelReplyTarget>,
@@ -4807,6 +4822,7 @@ async fn deliver_channel_replies_to_targets(
     let session_key = session_key.to_string();
     let text = text.to_string();
     let logbook_html = format_logbook_html(&status_log);
+    let logbook_text = format_logbook_text(&status_log);
     let mut tasks = Vec::with_capacity(targets.len());
     for target in targets {
         let outbound = Arc::clone(&outbound);
@@ -4814,6 +4830,7 @@ async fn deliver_channel_replies_to_targets(
         let session_key = session_key.clone();
         let text = text.clone();
         let logbook_html = logbook_html.clone();
+        let logbook_text = logbook_text.clone();
         tasks.push(tokio::spawn(async move {
             let tts_payload = match desired_reply_medium {
                 ReplyMedium::Voice => build_tts_payload(&state, &session_key, &target, &text).await,
@@ -4921,6 +4938,82 @@ async fn deliver_channel_replies_to_targets(
                             );
                         }
                     },
+                },
+                moltis_channels::ChannelType::Slack => {
+                    match tts_payload {
+                        Some(payload) => {
+                            if let Err(e) = outbound
+                                .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                                .await
+                            {
+                                warn!(
+                                    account_id = target.account_id,
+                                    chat_id = target.chat_id,
+                                    "failed to send slack voice reply: {e}"
+                                );
+                            }
+                            if !payload.text.is_empty()
+                                && let Err(e) = outbound
+                                    .send_text(
+                                        &target.account_id,
+                                        &target.chat_id,
+                                        &payload.text,
+                                        None,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    account_id = target.account_id,
+                                    chat_id = target.chat_id,
+                                    "failed to send slack transcript follow-up: {e}"
+                                );
+                            }
+                            if !logbook_text.is_empty()
+                                && let Err(e) = outbound
+                                    .send_text(
+                                        &target.account_id,
+                                        &target.chat_id,
+                                        &logbook_text,
+                                        None,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    account_id = target.account_id,
+                                    chat_id = target.chat_id,
+                                    "failed to send slack logbook follow-up: {e}"
+                                );
+                            }
+                        },
+                        None => {
+                            let result = outbound
+                                .send_text(&target.account_id, &target.chat_id, &text, reply_to)
+                                .await;
+                            if let Err(e) = result {
+                                warn!(
+                                    account_id = target.account_id,
+                                    chat_id = target.chat_id,
+                                    "failed to send slack channel reply: {e}"
+                                );
+                            }
+                            if !logbook_text.is_empty()
+                                && let Err(e) = outbound
+                                    .send_text(
+                                        &target.account_id,
+                                        &target.chat_id,
+                                        &logbook_text,
+                                        None,
+                                    )
+                                    .await
+                            {
+                                warn!(
+                                    account_id = target.account_id,
+                                    chat_id = target.chat_id,
+                                    "failed to send slack logbook follow-up: {e}"
+                                );
+                            }
+                        },
+                    }
                 },
             }
         }));
@@ -5238,6 +5331,29 @@ async fn send_screenshot_to_channels(
                             account_id = target.account_id,
                             chat_id = target.chat_id,
                             "sent screenshot to telegram"
+                        );
+                    }
+                },
+                moltis_channels::ChannelType::Slack => {
+                    let reply_to = target.message_id.as_deref();
+                    if let Err(e) = outbound
+                        .send_media(&target.account_id, &target.chat_id, &payload, reply_to)
+                        .await
+                    {
+                        warn!(
+                            account_id = target.account_id,
+                            chat_id = target.chat_id,
+                            "failed to send screenshot to slack: {e}"
+                        );
+                        let error_msg = format!("Failed to send screenshot: {e}");
+                        let _ = outbound
+                            .send_text(&target.account_id, &target.chat_id, &error_msg, reply_to)
+                            .await;
+                    } else {
+                        debug!(
+                            account_id = target.account_id,
+                            chat_id = target.chat_id,
+                            "sent screenshot to slack"
                         );
                     }
                 },

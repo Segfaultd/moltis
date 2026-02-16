@@ -198,6 +198,21 @@ test.describe("Settings navigation", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
+	test("channels add slack app modal renders required fields", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await navigateAndWait(page, "/settings/channels");
+		await waitForWsConnected(page);
+
+		const addButton = page.getByRole("button", { name: "+ Add Slack App", exact: true });
+		await expect(addButton).toBeVisible();
+		await addButton.click();
+
+		await expect(page.getByRole("heading", { name: "Add Slack App", exact: true })).toBeVisible();
+		await expect(page.getByPlaceholder("xapp-...")).toHaveAttribute("type", "password");
+		await expect(page.getByPlaceholder("xoxb-...")).toHaveAttribute("type", "password");
+		expect(pageErrors).toEqual([]);
+	});
+
 	test("sidebar groups and order match product layout", async ({ page }) => {
 		await navigateAndWait(page, "/settings/identity");
 
