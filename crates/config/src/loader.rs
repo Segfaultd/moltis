@@ -280,6 +280,11 @@ pub fn heartbeat_path() -> PathBuf {
     data_dir().join("HEARTBEAT.md")
 }
 
+/// Path to the workspace `MEMORY.md` file.
+pub fn memory_path() -> PathBuf {
+    data_dir().join("MEMORY.md")
+}
+
 /// Load identity values from `IDENTITY.md` frontmatter if present.
 pub fn load_identity() -> Option<AgentIdentity> {
     let path = identity_path();
@@ -414,6 +419,11 @@ pub fn load_tools_md() -> Option<String> {
 /// Load HEARTBEAT.md from the workspace root (`data_dir`) if present and non-empty.
 pub fn load_heartbeat_md() -> Option<String> {
     load_workspace_markdown(heartbeat_path())
+}
+
+/// Load MEMORY.md from the workspace root (`data_dir`) if present and non-empty.
+pub fn load_memory_md() -> Option<String> {
+    load_workspace_markdown(memory_path())
 }
 
 /// Persist SOUL.md in the workspace root (`data_dir`).
@@ -654,7 +664,12 @@ fn strip_leading_html_comments(content: &str) -> &str {
     }
 }
 
-fn home_dir() -> Option<PathBuf> {
+/// Returns the user's home directory (`$HOME` / `~`).
+///
+/// This is the **single call-site** for `directories::BaseDirs` — all other
+/// crates must call this via `moltis_config::home_dir()` instead of using the
+/// `directories` crate directly.
+pub fn home_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf())
 }
 
@@ -986,8 +1001,8 @@ mod tests {
         _data_dir: Option<PathBuf>,
     }
 
-    static DATA_DIR_TEST_LOCK: std::sync::Mutex<TestDataDirState> =
-        std::sync::Mutex::new(TestDataDirState { _data_dir: None });
+    static DATA_DIR_TEST_LOCK: Mutex<TestDataDirState> =
+        Mutex::new(TestDataDirState { _data_dir: None });
 
     #[test]
     fn parse_env_value_bool() {
@@ -1149,6 +1164,18 @@ mod tests {
         assert!(
             raw.contains("port = 23456"),
             "generated template should include selected server port"
+        );
+        assert!(
+            raw.contains("message_queue_mode = \"followup\""),
+            "generated template should set followup queue mode by default"
+        );
+        assert!(
+            raw.contains("\"followup\" - Queue messages, replay one-by-one after run"),
+            "generated template should document the followup queue option"
+        );
+        assert!(
+            raw.contains("\"collect\"  - Buffer messages, concatenate as single message"),
+            "generated template should document the collect queue option"
         );
     }
 
@@ -1400,6 +1427,47 @@ name = "Rex"
 
         std::fs::write(dir.path().join("HEARTBEAT.md"), "\n# Heartbeat\n- ping\n").unwrap();
         assert_eq!(load_heartbeat_md().as_deref(), Some("# Heartbeat\n- ping"));
+
+        clear_data_dir();
+    }
+
+    #[test]
+    fn load_memory_md_reads_trimmed_content() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        std::fs::write(
+            dir.path().join("MEMORY.md"),
+            "\n## User Facts\n- Lives in Paris\n",
+        )
+        .unwrap();
+        assert_eq!(
+            load_memory_md().as_deref(),
+            Some("## User Facts\n- Lives in Paris")
+        );
+
+        clear_data_dir();
+    }
+
+    #[test]
+    fn load_memory_md_returns_none_when_missing() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        assert_eq!(load_memory_md(), None);
+
+        clear_data_dir();
+    }
+
+    #[test]
+    fn memory_path_is_under_data_dir() {
+        let _guard = DATA_DIR_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        set_data_dir(dir.path().to_path_buf());
+
+        assert_eq!(memory_path(), dir.path().join("MEMORY.md"));
 
         clear_data_dir();
     }

@@ -79,11 +79,17 @@ pub fn raw_model_id(model_id: &str) -> &str {
         .unwrap_or(model_id)
 }
 
-fn configured_model_for_provider<'a>(provider: &str, model_id: &'a str) -> &'a str {
-    match model_id.split_once(MODEL_ID_NAMESPACE_SEP) {
-        Some((cfg_provider, raw)) if cfg_provider == provider => raw,
-        _ => model_id,
-    }
+#[must_use]
+fn capability_model_id(model_id: &str) -> &str {
+    let raw = raw_model_id(model_id).trim();
+    raw.rsplit('/')
+        .next()
+        .filter(|id| !id.is_empty())
+        .unwrap_or(raw)
+}
+
+fn configured_model_for_provider(model_id: &str) -> &str {
+    raw_model_id(model_id)
 }
 
 fn configured_models_for_provider(config: &ProvidersConfig, provider: &str) -> Vec<String> {
@@ -95,7 +101,7 @@ fn configured_models_for_provider(config: &ProvidersConfig, provider: &str) -> V
     normalize_unique_models(
         configured
             .into_iter()
-            .map(|model| configured_model_for_provider(provider, model.trim()).to_string()),
+            .map(|model| configured_model_for_provider(model.trim()).to_string()),
     )
 }
 
@@ -184,6 +190,25 @@ fn merge_discovered_with_fallback_catalog(
 fn normalize_ollama_api_base_url(base_url: &str) -> String {
     let trimmed = base_url.trim_end_matches('/');
     trimmed.strip_suffix("/v1").unwrap_or(trimmed).to_string()
+}
+
+/// Parse `Retry-After` header as milliseconds.
+///
+/// `Retry-After` may be either delta-seconds or an HTTP date. We currently
+/// consume delta-seconds, which is what providers typically return for 429.
+pub(crate) fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let value = headers.get(reqwest::header::RETRY_AFTER)?;
+    let text = value.to_str().ok()?.trim();
+    let seconds = text.parse::<u64>().ok()?;
+    seconds.checked_mul(1_000)
+}
+
+/// Attach an explicit retry hint marker consumable by runner retry logic.
+pub(crate) fn with_retry_after_marker(base: String, retry_after_ms: Option<u64>) -> String {
+    match retry_after_ms {
+        Some(ms) => format!("{base} (retry_after_ms={ms})"),
+        None => base,
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -294,27 +319,37 @@ impl LlmProvider for RegistryModelProvider {
 
 /// Resolve an API key from config (Secret) or environment variable,
 /// keeping the value wrapped in `Secret<String>` to avoid leaking it.
+fn env_value(env_overrides: &HashMap<String, String>, key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env_overrides
+                .get(key)
+                .cloned()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+/// Resolve an API key from config (Secret) or environment variable,
+/// keeping the value wrapped in `Secret<String>` to avoid leaking it.
 fn resolve_api_key(
     config: &ProvidersConfig,
     provider: &str,
     env_key: &str,
+    env_overrides: &HashMap<String, String>,
 ) -> Option<secrecy::Secret<String>> {
     config
         .get(provider)
         .and_then(|e| e.api_key.clone())
-        .or_else(|| {
-            std::env::var(env_key)
-                .ok()
-                .filter(|k| !k.is_empty())
-                .map(secrecy::Secret::new)
-        })
+        .or_else(|| env_value(env_overrides, env_key).map(secrecy::Secret::new))
         .filter(|s| !s.expose_secret().is_empty())
 }
 
 /// Return the known context window size (in tokens) for a model ID.
 /// Falls back to 200,000 for unknown models.
 pub fn context_window_for_model(model_id: &str) -> u32 {
-    let model_id = raw_model_id(model_id);
+    let model_id = capability_model_id(model_id);
     // Codestral has the largest window at 256k.
     if model_id.starts_with("codestral") {
         return 256_000;
@@ -343,6 +378,18 @@ pub fn context_window_for_model(model_id: &str) -> u32 {
     if model_id.starts_with("kimi-") {
         return 128_000;
     }
+    // MiniMax M2/M2.1/M2.5: 204,800.
+    if model_id.starts_with("MiniMax-") {
+        return 204_800;
+    }
+    // Z.AI GLM-4-32B: 128k.
+    if model_id == "glm-4-32b-0414-128k" {
+        return 128_000;
+    }
+    // Z.AI GLM-5/4.7/4.6/4.5 series: 128k.
+    if model_id.starts_with("glm-") {
+        return 128_000;
+    }
     // Default fallback.
     200_000
 }
@@ -355,7 +402,7 @@ pub fn context_window_for_model(model_id: &str) -> u32 {
 /// patterns. This is applied both at discovery time and at display time so that
 /// non-chat models never appear in the UI.
 pub fn is_chat_capable_model(model_id: &str) -> bool {
-    let id = raw_model_id(model_id);
+    let id = capability_model_id(model_id);
     const NON_CHAT_PREFIXES: &[&str] = &[
         "dall-e",
         "gpt-image",
@@ -367,6 +414,14 @@ pub fn is_chat_capable_model(model_id: &str) -> bool {
         "omni-moderation",
         "moderation-",
         "sora",
+        // Z.AI non-chat models
+        "glm-image",
+        "glm-asr",
+        "glm-ocr",
+        "cogvideo",
+        "cogview",
+        "vidu",
+        "autoglm-phone",
     ];
     for prefix in NON_CHAT_PREFIXES {
         if id.starts_with(prefix) {
@@ -393,7 +448,7 @@ pub fn is_chat_capable_model(model_id: &str) -> bool {
 /// This is checked per-model rather than per-provider so that providers
 /// exposing mixed catalogs report accurate tool support.
 pub fn supports_tools_for_model(model_id: &str) -> bool {
-    let id = raw_model_id(model_id);
+    let id = capability_model_id(model_id);
     // Legacy completions-only models — no tool support
     if id.starts_with("babbage") || id.starts_with("davinci") {
         return false;
@@ -418,7 +473,7 @@ pub fn supports_tools_for_model(model_id: &str) -> bool {
 /// When true, the runner sends images as multimodal content blocks rather than
 /// stripping them from the context.
 pub fn supports_vision_for_model(model_id: &str) -> bool {
-    let model_id = raw_model_id(model_id);
+    let model_id = capability_model_id(model_id);
     // Claude models: all modern Claude models support vision
     if model_id.starts_with("claude-") {
         return true;
@@ -441,6 +496,10 @@ pub fn supports_vision_for_model(model_id: &str) -> bool {
     }
     // Gemini models support vision
     if model_id.starts_with("gemini-") {
+        return true;
+    }
+    // Z.AI GLM vision models
+    if model_id.starts_with("glm-") && model_id.contains('v') {
         return true;
     }
     // Default: no vision support
@@ -482,7 +541,31 @@ const CEREBRAS_MODELS: &[(&str, &str)] =
     &[("llama-4-scout-17b-16e-instruct", "Llama 4 Scout (Cerebras)")];
 
 /// Known MiniMax models.
-const MINIMAX_MODELS: &[(&str, &str)] = &[("MiniMax-M2.1", "MiniMax M2.1")];
+/// See: <https://platform.minimax.io/docs/api-reference/text-anthropic-api>
+const MINIMAX_MODELS: &[(&str, &str)] = &[
+    ("MiniMax-M2.5", "MiniMax M2.5"),
+    ("MiniMax-M2.5-highspeed", "MiniMax M2.5 Highspeed"),
+    ("MiniMax-M2.1", "MiniMax M2.1"),
+    ("MiniMax-M2", "MiniMax M2"),
+];
+
+/// Known Z.AI (Zhipu) models.
+/// See: <https://docs.z.ai/api-reference/llm/chat-completion>
+const ZAI_MODELS: &[(&str, &str)] = &[
+    ("glm-5", "GLM-5"),
+    ("glm-4.7", "GLM-4.7"),
+    ("glm-4.7-flash", "GLM-4.7 Flash"),
+    ("glm-4.7-flashx", "GLM-4.7 FlashX"),
+    ("glm-4.6", "GLM-4.6"),
+    ("glm-4.6v", "GLM-4.6V (Vision)"),
+    ("glm-4.6v-flash", "GLM-4.6V Flash"),
+    ("glm-4.5", "GLM-4.5"),
+    ("glm-4.5-air", "GLM-4.5 Air"),
+    ("glm-4.5-airx", "GLM-4.5 AirX"),
+    ("glm-4.5-flash", "GLM-4.5 Flash"),
+    ("glm-4.5v", "GLM-4.5V (Vision)"),
+    ("glm-4-32b-0414-128k", "GLM-4 32B 128K"),
+];
 
 /// Known Moonshot models.
 const MOONSHOT_MODELS: &[(&str, &str)] = &[("kimi-k2.5", "Kimi K2.5")];
@@ -494,6 +577,11 @@ struct OpenAiCompatDef {
     env_base_url_key: &'static str,
     default_base_url: &'static str,
     models: &'static [(&'static str, &'static str)],
+    /// Whether to attempt `/models` discovery by default. Providers whose API
+    /// does not expose a models endpoint (e.g. MiniMax returns 404) should set
+    /// this to `false` so the static catalog is used without a noisy warning.
+    /// Users can still override via `fetch_models = true` in config.
+    supports_model_discovery: bool,
 }
 
 const OPENAI_COMPAT_PROVIDERS: &[OpenAiCompatDef] = &[
@@ -503,6 +591,7 @@ const OPENAI_COMPAT_PROVIDERS: &[OpenAiCompatDef] = &[
         env_base_url_key: "MISTRAL_BASE_URL",
         default_base_url: "https://api.mistral.ai/v1",
         models: MISTRAL_MODELS,
+        supports_model_discovery: true,
     },
     OpenAiCompatDef {
         config_name: "openrouter",
@@ -510,6 +599,7 @@ const OPENAI_COMPAT_PROVIDERS: &[OpenAiCompatDef] = &[
         env_base_url_key: "OPENROUTER_BASE_URL",
         default_base_url: "https://openrouter.ai/api/v1",
         models: &[],
+        supports_model_discovery: true,
     },
     OpenAiCompatDef {
         config_name: "cerebras",
@@ -517,13 +607,16 @@ const OPENAI_COMPAT_PROVIDERS: &[OpenAiCompatDef] = &[
         env_base_url_key: "CEREBRAS_BASE_URL",
         default_base_url: "https://api.cerebras.ai/v1",
         models: CEREBRAS_MODELS,
+        supports_model_discovery: true,
     },
     OpenAiCompatDef {
         config_name: "minimax",
         env_key: "MINIMAX_API_KEY",
         env_base_url_key: "MINIMAX_BASE_URL",
-        default_base_url: "https://api.minimax.chat/v1",
+        default_base_url: "https://api.minimax.io/v1",
         models: MINIMAX_MODELS,
+        // MiniMax API does not expose a /models endpoint (returns 404).
+        supports_model_discovery: false,
     },
     OpenAiCompatDef {
         config_name: "moonshot",
@@ -531,6 +624,15 @@ const OPENAI_COMPAT_PROVIDERS: &[OpenAiCompatDef] = &[
         env_base_url_key: "MOONSHOT_BASE_URL",
         default_base_url: "https://api.moonshot.ai/v1",
         models: MOONSHOT_MODELS,
+        supports_model_discovery: true,
+    },
+    OpenAiCompatDef {
+        config_name: "zai",
+        env_key: "Z_API_KEY",
+        env_base_url_key: "Z_BASE_URL",
+        default_base_url: "https://api.z.ai/api/paas/v4",
+        models: ZAI_MODELS,
+        supports_model_discovery: true,
     },
     OpenAiCompatDef {
         config_name: "venice",
@@ -538,6 +640,7 @@ const OPENAI_COMPAT_PROVIDERS: &[OpenAiCompatDef] = &[
         env_base_url_key: "VENICE_BASE_URL",
         default_base_url: "https://api.venice.ai/api/v1",
         models: &[],
+        supports_model_discovery: true,
     },
     OpenAiCompatDef {
         config_name: "ollama",
@@ -545,6 +648,7 @@ const OPENAI_COMPAT_PROVIDERS: &[OpenAiCompatDef] = &[
         env_base_url_key: "OLLAMA_BASE_URL",
         default_base_url: "http://127.0.0.1:11434/v1",
         models: &[],
+        supports_model_discovery: true,
     },
 ];
 
@@ -844,22 +948,33 @@ impl ProviderRegistry {
     /// 3. genai-backed providers (if `provider-genai` feature enabled, no tool support)
     /// 4. OpenAI Codex OAuth providers (if `provider-openai-codex` feature enabled)
     pub fn from_env_with_config(config: &ProvidersConfig) -> Self {
+        let env_overrides = HashMap::new();
+        Self::from_env_with_config_and_overrides(config, &env_overrides)
+    }
+
+    /// Auto-discover providers from config, process env, and optional env
+    /// overrides. Process env always wins when both are present.
+    pub fn from_env_with_config_and_overrides(
+        config: &ProvidersConfig,
+        env_overrides: &HashMap<String, String>,
+    ) -> Self {
         let mut reg = Self::empty();
 
         // Built-in providers first: they support tool calling.
-        reg.register_builtin_providers(config);
-        reg.register_openai_compatible_providers(config);
+        reg.register_builtin_providers(config, env_overrides);
+        reg.register_openai_compatible_providers(config, env_overrides);
+        reg.register_custom_providers(config);
 
         #[cfg(feature = "provider-async-openai")]
         {
-            reg.register_async_openai_providers(config);
+            reg.register_async_openai_providers(config, env_overrides);
         }
 
         // GenAI providers last: they don't support tool calling,
         // so they only fill in models not already covered above.
         #[cfg(feature = "provider-genai")]
         {
-            reg.register_genai_providers(config);
+            reg.register_genai_providers(config, env_overrides);
         }
 
         #[cfg(feature = "provider-openai-codex")]
@@ -874,7 +989,7 @@ impl ProviderRegistry {
 
         #[cfg(feature = "provider-kimi-code")]
         {
-            reg.register_kimi_code_providers(config);
+            reg.register_kimi_code_providers(config, env_overrides);
         }
 
         // Local GGUF providers (no API key needed, model runs locally)
@@ -887,7 +1002,11 @@ impl ProviderRegistry {
     }
 
     #[cfg(feature = "provider-genai")]
-    fn register_genai_providers(&mut self, config: &ProvidersConfig) {
+    fn register_genai_providers(
+        &mut self,
+        config: &ProvidersConfig,
+        env_overrides: &HashMap<String, String>,
+    ) {
         // (env_key, provider_config_name, model_id, display_name)
         let genai_models: &[(&str, &str, &str, &str)] = &[
             (
@@ -924,7 +1043,8 @@ impl ProviderRegistry {
             }
 
             // Use config api_key or fall back to env var.
-            let Some(resolved_key) = resolve_api_key(config, provider_name, env_key) else {
+            let Some(resolved_key) = resolve_api_key(config, provider_name, env_key, env_overrides)
+            else {
                 continue;
             };
 
@@ -958,19 +1078,23 @@ impl ProviderRegistry {
     }
 
     #[cfg(feature = "provider-async-openai")]
-    fn register_async_openai_providers(&mut self, config: &ProvidersConfig) {
+    fn register_async_openai_providers(
+        &mut self,
+        config: &ProvidersConfig,
+        env_overrides: &HashMap<String, String>,
+    ) {
         if !config.is_enabled("openai") {
             return;
         }
 
-        let Some(key) = resolve_api_key(config, "openai", "OPENAI_API_KEY") else {
+        let Some(key) = resolve_api_key(config, "openai", "OPENAI_API_KEY", env_overrides) else {
             return;
         };
 
         let base_url = config
             .get("openai")
             .and_then(|e| e.base_url.clone())
-            .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+            .or_else(|| env_value(env_overrides, "OPENAI_BASE_URL"))
             .unwrap_or_else(|| "https://api.openai.com/v1".into());
 
         let model_id = configured_models_for_provider(config, "openai")
@@ -1071,12 +1195,16 @@ impl ProviderRegistry {
     }
 
     #[cfg(feature = "provider-kimi-code")]
-    fn register_kimi_code_providers(&mut self, config: &ProvidersConfig) {
+    fn register_kimi_code_providers(
+        &mut self,
+        config: &ProvidersConfig,
+        env_overrides: &HashMap<String, String>,
+    ) {
         if !config.is_enabled("kimi-code") {
             return;
         }
 
-        let api_key = resolve_api_key(config, "kimi-code", "KIMI_API_KEY");
+        let api_key = resolve_api_key(config, "kimi-code", "KIMI_API_KEY", env_overrides);
         let has_oauth_tokens = kimi_code::has_stored_tokens();
         if api_key.is_none() && !has_oauth_tokens {
             return;
@@ -1085,7 +1213,7 @@ impl ProviderRegistry {
         let base_url = config
             .get("kimi-code")
             .and_then(|e| e.base_url.clone())
-            .or_else(|| std::env::var("KIMI_BASE_URL").ok())
+            .or_else(|| env_value(env_overrides, "KIMI_BASE_URL"))
             .unwrap_or_else(|| "https://api.kimi.com/coding/v1".into());
 
         let build_provider = |model_id: &str| -> Arc<dyn LlmProvider> {
@@ -1206,15 +1334,20 @@ impl ProviderRegistry {
         }
     }
 
-    fn register_builtin_providers(&mut self, config: &ProvidersConfig) {
+    fn register_builtin_providers(
+        &mut self,
+        config: &ProvidersConfig,
+        env_overrides: &HashMap<String, String>,
+    ) {
         // Anthropic — register all known Claude models when API key is available.
         if config.is_enabled("anthropic")
-            && let Some(key) = resolve_api_key(config, "anthropic", "ANTHROPIC_API_KEY")
+            && let Some(key) =
+                resolve_api_key(config, "anthropic", "ANTHROPIC_API_KEY", env_overrides)
         {
             let base_url = config
                 .get("anthropic")
                 .and_then(|e| e.base_url.clone())
-                .or_else(|| std::env::var("ANTHROPIC_BASE_URL").ok())
+                .or_else(|| env_value(env_overrides, "ANTHROPIC_BASE_URL"))
                 .unwrap_or_else(|| "https://api.anthropic.com".into());
 
             // Get alias if configured (for metrics differentiation).
@@ -1257,12 +1390,12 @@ impl ProviderRegistry {
 
         // OpenAI — register all known OpenAI models when API key is available.
         if config.is_enabled("openai")
-            && let Some(key) = resolve_api_key(config, "openai", "OPENAI_API_KEY")
+            && let Some(key) = resolve_api_key(config, "openai", "OPENAI_API_KEY", env_overrides)
         {
             let base_url = config
                 .get("openai")
                 .and_then(|e| e.base_url.clone())
-                .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+                .or_else(|| env_value(env_overrides, "OPENAI_BASE_URL"))
                 .unwrap_or_else(|| "https://api.openai.com/v1".into());
 
             // Get alias if configured (for metrics differentiation).
@@ -1301,13 +1434,17 @@ impl ProviderRegistry {
         }
     }
 
-    fn register_openai_compatible_providers(&mut self, config: &ProvidersConfig) {
+    fn register_openai_compatible_providers(
+        &mut self,
+        config: &ProvidersConfig,
+        env_overrides: &HashMap<String, String>,
+    ) {
         for def in OPENAI_COMPAT_PROVIDERS {
             if !config.is_enabled(def.config_name) {
                 continue;
             }
 
-            let key = resolve_api_key(config, def.config_name, def.env_key);
+            let key = resolve_api_key(config, def.config_name, def.env_key, env_overrides);
 
             // Ollama doesn't require an API key — use a dummy value.
             let key = if def.config_name == "ollama" {
@@ -1323,7 +1460,7 @@ impl ProviderRegistry {
             let base_url = config
                 .get(def.config_name)
                 .and_then(|e| e.base_url.clone())
-                .or_else(|| std::env::var(def.env_base_url_key).ok())
+                .or_else(|| env_value(env_overrides, def.env_base_url_key))
                 .unwrap_or_else(|| def.default_base_url.into());
 
             // Get alias if configured (for metrics differentiation).
@@ -1332,52 +1469,67 @@ impl ProviderRegistry {
             let preferred = configured_models_for_provider(config, def.config_name);
             if def.config_name == "ollama" {
                 let has_explicit_entry = config.get("ollama").is_some();
-                let has_env_base_url = std::env::var(def.env_base_url_key)
-                    .ok()
-                    .is_some_and(|value| !value.trim().is_empty());
+                let has_env_base_url = env_value(env_overrides, def.env_base_url_key).is_some();
                 if !has_explicit_entry && !has_env_base_url && preferred.is_empty() {
                     continue;
                 }
             }
-            // "Bring your own model" providers (empty static catalog, no
-            // configured models) skip discovery — the user must pick a model.
-            let skip_discovery =
-                def.models.is_empty() && preferred.is_empty() && def.config_name != "ollama";
-            let discovered = if !skip_discovery && should_fetch_models(config, def.config_name) {
-                if def.config_name == "ollama" {
-                    match discover_ollama_models(&base_url) {
-                        Ok(models) => models,
-                        Err(err) => {
-                            tracing::warn!(
-                                provider = def.config_name,
-                                error = %err,
-                                "failed to fetch live models for provider"
-                            );
-                            def.models
-                                .iter()
-                                .map(|(id, name)| DiscoveredModel::new(*id, *name))
-                                .collect()
-                        },
+            // Some providers need an explicit model before they can answer;
+            // keep discovery off there when no model is configured.
+            // OpenRouter supports `/models`, so we discover dynamically.
+            let skip_discovery = def.models.is_empty()
+                && preferred.is_empty()
+                && def.config_name != "ollama"
+                && (def.config_name == "venice" || cfg!(test));
+            // Respect `supports_model_discovery`: providers whose API lacks a
+            // /models endpoint (e.g. MiniMax) skip live fetch unless the user
+            // explicitly opted in via `fetch_models = true` in config.
+            let user_opted_in = config
+                .get(def.config_name)
+                .is_some_and(|entry| entry.fetch_models);
+            let try_fetch = def.supports_model_discovery || user_opted_in;
+            let discovered =
+                if !skip_discovery && try_fetch && should_fetch_models(config, def.config_name) {
+                    if def.config_name == "ollama" {
+                        match discover_ollama_models(&base_url) {
+                            Ok(models) => models,
+                            Err(err) => {
+                                tracing::warn!(
+                                    provider = def.config_name,
+                                    error = %err,
+                                    "failed to fetch live models for provider"
+                                );
+                                def.models
+                                    .iter()
+                                    .map(|(id, name)| DiscoveredModel::new(*id, *name))
+                                    .collect()
+                            },
+                        }
+                    } else {
+                        match openai::live_models(&key, &base_url) {
+                            Ok(models) => models,
+                            Err(err) => {
+                                tracing::warn!(
+                                    provider = def.config_name,
+                                    error = %err,
+                                    "failed to fetch live models for provider"
+                                );
+                                def.models
+                                    .iter()
+                                    .map(|(id, name)| DiscoveredModel::new(*id, *name))
+                                    .collect()
+                            },
+                        }
                     }
+                } else if !def.supports_model_discovery && !def.models.is_empty() {
+                    // Provider has no /models endpoint — use the static catalog.
+                    def.models
+                        .iter()
+                        .map(|(id, name)| DiscoveredModel::new(*id, *name))
+                        .collect()
                 } else {
-                    match openai::live_models(&key, &base_url) {
-                        Ok(models) => models,
-                        Err(err) => {
-                            tracing::warn!(
-                                provider = def.config_name,
-                                error = %err,
-                                "failed to fetch live models for provider"
-                            );
-                            def.models
-                                .iter()
-                                .map(|(id, name)| DiscoveredModel::new(*id, *name))
-                                .collect()
-                        },
-                    }
-                }
-            } else {
-                Vec::new()
-            };
+                    Vec::new()
+                };
             let models = merge_preferred_and_discovered_models(preferred, discovered);
             for model in models {
                 let (model_id, display_name, created_at) =
@@ -1401,6 +1553,84 @@ impl ProviderRegistry {
                     provider,
                 );
             }
+        }
+    }
+
+    /// Register custom OpenAI-compatible providers (names starting with `custom-`).
+    /// These are user-added endpoints that may support model discovery via `/v1/models`.
+    fn register_custom_providers(&mut self, config: &ProvidersConfig) {
+        for (name, entry) in &config.providers {
+            if !name.starts_with("custom-") || !entry.enabled {
+                continue;
+            }
+
+            let Some(api_key) = entry
+                .api_key
+                .as_ref()
+                .filter(|k| !k.expose_secret().is_empty())
+            else {
+                continue;
+            };
+
+            let Some(base_url) = entry.base_url.as_ref().filter(|u| !u.trim().is_empty()) else {
+                continue;
+            };
+
+            let preferred = configured_models_for_provider(config, name);
+
+            // Try model discovery, fall back to configured models.
+            let discovered = if should_fetch_models(config, name) {
+                match openai::live_models(api_key, base_url) {
+                    Ok(models) => models,
+                    Err(err) => {
+                        tracing::warn!(
+                            provider = %name,
+                            error = %err,
+                            "failed to fetch live models for custom provider"
+                        );
+                        Vec::new()
+                    },
+                }
+            } else {
+                Vec::new()
+            };
+
+            let models = merge_preferred_and_discovered_models(preferred, discovered);
+            if models.is_empty() {
+                tracing::debug!(
+                    provider = %name,
+                    "custom provider has no models — skipping registration"
+                );
+                continue;
+            }
+
+            for model in models {
+                let (model_id, display_name, created_at) =
+                    (model.id, model.display_name, model.created_at);
+                if self.has_provider_model(name, &model_id) {
+                    continue;
+                }
+                let provider = Arc::new(openai::OpenAiProvider::new_with_name(
+                    api_key.clone(),
+                    model_id.clone(),
+                    base_url.clone(),
+                    name.clone(),
+                ));
+                self.register(
+                    ModelInfo {
+                        id: model_id,
+                        provider: name.clone(),
+                        display_name,
+                        created_at,
+                    },
+                    provider,
+                );
+            }
+
+            tracing::info!(
+                provider = %name,
+                "registered custom OpenAI-compatible provider"
+            );
         }
     }
 
@@ -1504,7 +1734,7 @@ impl ProviderRegistry {
             .models
             .iter()
             .map(|m| m.provider.as_str())
-            .collect::<std::collections::HashSet<_>>()
+            .collect::<HashSet<_>>()
             .len();
         let model_count = self.models.len();
         format!(
@@ -1537,37 +1767,39 @@ mod tests {
     #[test]
     fn context_window_for_known_models() {
         assert_eq!(
-            super::context_window_for_model("claude-sonnet-4-20250514"),
+            context_window_for_model("claude-sonnet-4-20250514"),
             200_000
         );
         assert_eq!(
-            super::context_window_for_model("claude-opus-4-5-20251101"),
+            context_window_for_model("claude-opus-4-5-20251101"),
             200_000
         );
-        assert_eq!(super::context_window_for_model("gpt-4o"), 128_000);
-        assert_eq!(super::context_window_for_model("gpt-4o-mini"), 128_000);
-        assert_eq!(super::context_window_for_model("gpt-4-turbo"), 128_000);
-        assert_eq!(super::context_window_for_model("o3"), 200_000);
-        assert_eq!(super::context_window_for_model("o3-mini"), 200_000);
-        assert_eq!(super::context_window_for_model("o4-mini"), 200_000);
-        assert_eq!(super::context_window_for_model("codestral-latest"), 256_000);
+        assert_eq!(context_window_for_model("gpt-4o"), 128_000);
+        assert_eq!(context_window_for_model("gpt-4o-mini"), 128_000);
+        assert_eq!(context_window_for_model("gpt-4-turbo"), 128_000);
+        assert_eq!(context_window_for_model("o3"), 200_000);
+        assert_eq!(context_window_for_model("o3-mini"), 200_000);
+        assert_eq!(context_window_for_model("o4-mini"), 200_000);
+        assert_eq!(context_window_for_model("codestral-latest"), 256_000);
+        assert_eq!(context_window_for_model("mistral-large-latest"), 128_000);
+        assert_eq!(context_window_for_model("gemini-2.0-flash"), 1_000_000);
+        assert_eq!(context_window_for_model("kimi-k2.5"), 128_000);
+        // Z.AI GLM models
+        assert_eq!(context_window_for_model("glm-5"), 128_000);
+        assert_eq!(context_window_for_model("glm-4.7"), 128_000);
+        assert_eq!(context_window_for_model("glm-4.7-flash"), 128_000);
+        assert_eq!(context_window_for_model("glm-4.6"), 128_000);
+        assert_eq!(context_window_for_model("glm-4.5"), 128_000);
+        assert_eq!(context_window_for_model("glm-4-32b-0414-128k"), 128_000);
         assert_eq!(
-            super::context_window_for_model("mistral-large-latest"),
+            context_window_for_model("custom-openrouter::openai/gpt-5.2"),
             128_000
         );
-        assert_eq!(
-            super::context_window_for_model("gemini-2.0-flash"),
-            1_000_000
-        );
-        assert_eq!(super::context_window_for_model("kimi-k2.5"), 128_000);
     }
 
     #[test]
     fn context_window_fallback_for_unknown_model() {
-        assert_eq!(
-            super::context_window_for_model("some-unknown-model"),
-            200_000
-        );
+        assert_eq!(context_window_for_model("some-unknown-model"), 200_000);
     }
 
     #[test]
@@ -1586,42 +1818,56 @@ mod tests {
     #[test]
     fn supports_vision_for_known_models() {
         // Claude models support vision
-        assert!(super::supports_vision_for_model("claude-sonnet-4-20250514"));
-        assert!(super::supports_vision_for_model("claude-opus-4-5-20251101"));
-        assert!(super::supports_vision_for_model("claude-3-haiku-20240307"));
+        assert!(supports_vision_for_model("claude-sonnet-4-20250514"));
+        assert!(supports_vision_for_model("claude-opus-4-5-20251101"));
+        assert!(supports_vision_for_model("claude-3-haiku-20240307"));
 
         // GPT-4o variants support vision
-        assert!(super::supports_vision_for_model("gpt-4o"));
-        assert!(super::supports_vision_for_model("gpt-4o-mini"));
+        assert!(supports_vision_for_model("gpt-4o"));
+        assert!(supports_vision_for_model("gpt-4o-mini"));
+        assert!(supports_vision_for_model("openrouter::openai/gpt-4o"));
 
         // GPT-4 turbo supports vision
-        assert!(super::supports_vision_for_model("gpt-4-turbo"));
+        assert!(supports_vision_for_model("gpt-4-turbo"));
 
         // GPT-5 supports vision
-        assert!(super::supports_vision_for_model("gpt-5.2-codex"));
+        assert!(supports_vision_for_model("gpt-5.2-codex"));
 
         // o3/o4 series supports vision
-        assert!(super::supports_vision_for_model("o3"));
-        assert!(super::supports_vision_for_model("o3-mini"));
-        assert!(super::supports_vision_for_model("o4-mini"));
+        assert!(supports_vision_for_model("o3"));
+        assert!(supports_vision_for_model("o3-mini"));
+        assert!(supports_vision_for_model("o4-mini"));
 
         // Gemini supports vision
-        assert!(super::supports_vision_for_model("gemini-2.0-flash"));
+        assert!(supports_vision_for_model("gemini-2.0-flash"));
+        assert!(supports_vision_for_model(
+            "custom-openrouter::google/gemini-2.0-flash"
+        ));
+
+        // Z.AI vision models
+        assert!(supports_vision_for_model("glm-4.6v"));
+        assert!(supports_vision_for_model("glm-4.6v-flash"));
+        assert!(supports_vision_for_model("glm-4.5v"));
     }
 
     #[test]
     fn supports_vision_false_for_non_vision_models() {
         // Codestral is code-focused, no vision
-        assert!(!super::supports_vision_for_model("codestral-latest"));
+        assert!(!supports_vision_for_model("codestral-latest"));
 
         // Mistral Large - no vision
-        assert!(!super::supports_vision_for_model("mistral-large-latest"));
+        assert!(!supports_vision_for_model("mistral-large-latest"));
 
         // Kimi - no vision
-        assert!(!super::supports_vision_for_model("kimi-k2.5"));
+        assert!(!supports_vision_for_model("kimi-k2.5"));
+
+        // Z.AI text-only models - no vision
+        assert!(!supports_vision_for_model("glm-5"));
+        assert!(!supports_vision_for_model("glm-4.7"));
+        assert!(!supports_vision_for_model("glm-4.5"));
 
         // Unknown models default to no vision
-        assert!(!super::supports_vision_for_model("some-unknown-model"));
+        assert!(!supports_vision_for_model("some-unknown-model"));
     }
 
     #[test]
@@ -1649,59 +1895,85 @@ mod tests {
     #[test]
     fn is_chat_capable_filters_non_chat_models() {
         // Chat-capable models pass
-        assert!(super::is_chat_capable_model("gpt-5.2"));
-        assert!(super::is_chat_capable_model("gpt-4o"));
-        assert!(super::is_chat_capable_model("o4-mini"));
-        assert!(super::is_chat_capable_model("chatgpt-4o-latest"));
+        assert!(is_chat_capable_model("gpt-5.2"));
+        assert!(is_chat_capable_model("gpt-4o"));
+        assert!(is_chat_capable_model("o4-mini"));
+        assert!(is_chat_capable_model("chatgpt-4o-latest"));
 
         // Non-chat models are rejected
-        assert!(!super::is_chat_capable_model("dall-e-3"));
-        assert!(!super::is_chat_capable_model("gpt-image-1-mini"));
-        assert!(!super::is_chat_capable_model("chatgpt-image-latest"));
-        assert!(!super::is_chat_capable_model("gpt-audio"));
-        assert!(!super::is_chat_capable_model("tts-1"));
-        assert!(!super::is_chat_capable_model("gpt-4o-mini-tts"));
-        assert!(!super::is_chat_capable_model("gpt-4o-mini-tts-2025-12-15"));
-        assert!(!super::is_chat_capable_model("gpt-4o-audio-preview"));
-        assert!(!super::is_chat_capable_model("gpt-4o-realtime-preview"));
-        assert!(!super::is_chat_capable_model("gpt-4o-mini-transcribe"));
-        assert!(!super::is_chat_capable_model("sora"));
+        assert!(!is_chat_capable_model("dall-e-3"));
+        assert!(!is_chat_capable_model("gpt-image-1-mini"));
+        assert!(!is_chat_capable_model("chatgpt-image-latest"));
+        assert!(!is_chat_capable_model("gpt-audio"));
+        assert!(!is_chat_capable_model("tts-1"));
+        assert!(!is_chat_capable_model("gpt-4o-mini-tts"));
+        assert!(!is_chat_capable_model("gpt-4o-mini-tts-2025-12-15"));
+        assert!(!is_chat_capable_model("gpt-4o-audio-preview"));
+        assert!(!is_chat_capable_model("gpt-4o-realtime-preview"));
+        assert!(!is_chat_capable_model("gpt-4o-mini-transcribe"));
+        assert!(!is_chat_capable_model("sora"));
+
+        // Z.AI non-chat models
+        assert!(!is_chat_capable_model("glm-image"));
+        assert!(!is_chat_capable_model("glm-asr-2512"));
+        assert!(!is_chat_capable_model("glm-ocr"));
+        assert!(!is_chat_capable_model("cogvideox-3"));
+        assert!(!is_chat_capable_model("cogview-4"));
+        assert!(!is_chat_capable_model("vidu"));
+        assert!(!is_chat_capable_model("autoglm-phone-multilingual"));
+        // Z.AI chat models pass
+        assert!(is_chat_capable_model("glm-5"));
+        assert!(is_chat_capable_model("glm-4.7"));
+        assert!(is_chat_capable_model("glm-4.6v"));
 
         // Works with namespaced model IDs too
-        assert!(super::is_chat_capable_model("openai::gpt-5.2"));
-        assert!(!super::is_chat_capable_model("openai::dall-e-3"));
-        assert!(!super::is_chat_capable_model("openai::gpt-image-1-mini"));
-        assert!(!super::is_chat_capable_model("openai::gpt-4o-mini-tts"));
+        assert!(is_chat_capable_model("openai::gpt-5.2"));
+        assert!(is_chat_capable_model("custom-openrouter::openai/gpt-5.2"));
+        assert!(is_chat_capable_model(
+            "custom-openrouter::anthropic/claude-sonnet-4-20250514"
+        ));
+        assert!(!is_chat_capable_model("openai::dall-e-3"));
+        assert!(!is_chat_capable_model("openai::gpt-image-1-mini"));
+        assert!(!is_chat_capable_model("openai::gpt-4o-mini-tts"));
+        assert!(!is_chat_capable_model(
+            "custom-openrouter::openai/gpt-image-1-mini"
+        ));
     }
 
     #[test]
     fn supports_tools_for_chat_models() {
         // Modern chat models support tools
-        assert!(super::supports_tools_for_model("gpt-5.2"));
-        assert!(super::supports_tools_for_model("gpt-4o"));
-        assert!(super::supports_tools_for_model("gpt-4o-mini"));
-        assert!(super::supports_tools_for_model("o3"));
-        assert!(super::supports_tools_for_model("o4-mini"));
-        assert!(super::supports_tools_for_model("chatgpt-4o-latest"));
-        assert!(super::supports_tools_for_model("claude-sonnet-4-20250514"));
-        assert!(super::supports_tools_for_model("gemini-2.0-flash"));
-        assert!(super::supports_tools_for_model("codestral-latest"));
+        assert!(supports_tools_for_model("gpt-5.2"));
+        assert!(supports_tools_for_model("gpt-4o"));
+        assert!(supports_tools_for_model("gpt-4o-mini"));
+        assert!(supports_tools_for_model("o3"));
+        assert!(supports_tools_for_model("o4-mini"));
+        assert!(supports_tools_for_model("chatgpt-4o-latest"));
+        assert!(supports_tools_for_model("claude-sonnet-4-20250514"));
+        assert!(supports_tools_for_model("gemini-2.0-flash"));
+        assert!(supports_tools_for_model("codestral-latest"));
+        assert!(supports_tools_for_model(
+            "custom-openrouter::openai/gpt-5.2"
+        ));
     }
 
     #[test]
     fn supports_tools_false_for_legacy_and_non_chat_models() {
         // Legacy completions-only models
-        assert!(!super::supports_tools_for_model("babbage-002"));
-        assert!(!super::supports_tools_for_model("davinci-002"));
+        assert!(!supports_tools_for_model("babbage-002"));
+        assert!(!supports_tools_for_model("davinci-002"));
 
         // Non-chat model families
-        assert!(!super::supports_tools_for_model("dall-e-3"));
-        assert!(!super::supports_tools_for_model("gpt-image-1"));
-        assert!(!super::supports_tools_for_model("tts-1"));
-        assert!(!super::supports_tools_for_model("tts-1-hd"));
-        assert!(!super::supports_tools_for_model("whisper-1"));
-        assert!(!super::supports_tools_for_model("text-embedding-3-large"));
-        assert!(!super::supports_tools_for_model("omni-moderation-latest"));
+        assert!(!supports_tools_for_model("dall-e-3"));
+        assert!(!supports_tools_for_model("gpt-image-1"));
+        assert!(!supports_tools_for_model("tts-1"));
+        assert!(!supports_tools_for_model("tts-1-hd"));
+        assert!(!supports_tools_for_model("whisper-1"));
+        assert!(!supports_tools_for_model("text-embedding-3-large"));
+        assert!(!supports_tools_for_model("omni-moderation-latest"));
+        assert!(!supports_tools_for_model(
+            "custom-openrouter::openai/text-embedding-3-large"
+        ));
     }
 
     #[test]
@@ -1756,6 +2028,7 @@ mod tests {
         assert!(!MISTRAL_MODELS.is_empty());
         assert!(!CEREBRAS_MODELS.is_empty());
         assert!(!MINIMAX_MODELS.is_empty());
+        assert!(!ZAI_MODELS.is_empty());
         assert!(!MOONSHOT_MODELS.is_empty());
     }
 
@@ -1776,6 +2049,7 @@ mod tests {
             MISTRAL_MODELS,
             CEREBRAS_MODELS,
             MINIMAX_MODELS,
+            ZAI_MODELS,
             MOONSHOT_MODELS,
         ] {
             let mut ids: Vec<&str> = models.iter().map(|(id, _)| *id).collect();
@@ -1959,6 +2233,32 @@ mod tests {
     }
 
     #[test]
+    fn minimax_registers_with_env_override_api_key() {
+        let config = ProvidersConfig::default();
+        let env_overrides = HashMap::from([(
+            "MINIMAX_API_KEY".to_string(),
+            "sk-test-minimax-override".to_string(),
+        )]);
+
+        let reg = ProviderRegistry::from_env_with_config_and_overrides(&config, &env_overrides);
+        assert!(reg.list_models().iter().any(|m| m.provider == "minimax"));
+    }
+
+    #[test]
+    fn zai_registers_with_api_key() {
+        let mut config = ProvidersConfig::default();
+        config
+            .providers
+            .insert("zai".into(), moltis_config::schema::ProviderEntry {
+                api_key: Some(secrecy::Secret::new("sk-test-zai".into())),
+                ..Default::default()
+            });
+
+        let reg = ProviderRegistry::from_env_with_config(&config);
+        assert!(reg.list_models().iter().any(|m| m.provider == "zai"));
+    }
+
+    #[test]
     fn moonshot_registers_with_api_key() {
         let mut config = ProvidersConfig::default();
         config
@@ -2004,8 +2304,35 @@ mod tests {
             .iter()
             .filter(|m| m.provider == "openrouter")
             .collect();
-        assert_eq!(or_models.len(), 1);
-        assert_eq!(or_models[0].id, "openrouter::anthropic/claude-3-haiku");
+        assert!(
+            or_models
+                .iter()
+                .any(|m| m.id == "openrouter::anthropic/claude-3-haiku")
+        );
+    }
+
+    #[test]
+    fn openrouter_strips_foreign_namespace_in_config_model_ids() {
+        let mut config = ProvidersConfig::default();
+        config
+            .providers
+            .insert("openrouter".into(), moltis_config::schema::ProviderEntry {
+                api_key: Some(secrecy::Secret::new("sk-test-or".into())),
+                models: vec!["openai::gpt-5.2".into()],
+                ..Default::default()
+            });
+
+        let reg = ProviderRegistry::from_env_with_config(&config);
+        assert!(
+            reg.list_models()
+                .iter()
+                .any(|m| m.id == "openrouter::gpt-5.2")
+        );
+        assert!(
+            !reg.list_models()
+                .iter()
+                .any(|m| m.id == "openrouter::openai::gpt-5.2")
+        );
     }
 
     #[test]
@@ -2295,7 +2622,7 @@ mod tests {
         ];
         for model in claude_models {
             assert!(
-                super::supports_vision_for_model(model),
+                supports_vision_for_model(model),
                 "expected {} to support vision",
                 model
             );
@@ -2315,7 +2642,7 @@ mod tests {
         ];
         for model in gpt4o_models {
             assert!(
-                super::supports_vision_for_model(model),
+                supports_vision_for_model(model),
                 "expected {} to support vision",
                 model
             );
@@ -2334,7 +2661,7 @@ mod tests {
         ];
         for model in gpt5_models {
             assert!(
-                super::supports_vision_for_model(model),
+                supports_vision_for_model(model),
                 "expected {} to support vision",
                 model
             );
@@ -2347,7 +2674,7 @@ mod tests {
         let reasoning_models = ["o3", "o3-mini", "o3-preview", "o4", "o4-mini", "o4-preview"];
         for model in reasoning_models {
             assert!(
-                super::supports_vision_for_model(model),
+                supports_vision_for_model(model),
                 "expected {} to support vision",
                 model
             );
@@ -2367,7 +2694,7 @@ mod tests {
         ];
         for model in gemini_models {
             assert!(
-                super::supports_vision_for_model(model),
+                supports_vision_for_model(model),
                 "expected {} to support vision",
                 model
             );
@@ -2390,7 +2717,7 @@ mod tests {
         ];
         for model in text_only_models {
             assert!(
-                !super::supports_vision_for_model(model),
+                !supports_vision_for_model(model),
                 "expected {} to NOT support vision",
                 model
             );
@@ -2400,16 +2727,16 @@ mod tests {
     #[test]
     fn vision_support_is_case_sensitive() {
         // Model IDs are case-sensitive - uppercase should not match
-        assert!(!super::supports_vision_for_model("CLAUDE-SONNET-4"));
-        assert!(!super::supports_vision_for_model("GPT-4O"));
-        assert!(!super::supports_vision_for_model("Gemini-2.0-flash"));
+        assert!(!supports_vision_for_model("CLAUDE-SONNET-4"));
+        assert!(!supports_vision_for_model("GPT-4O"));
+        assert!(!supports_vision_for_model("Gemini-2.0-flash"));
     }
 
     #[test]
     fn vision_support_requires_exact_prefix() {
         // Vision support is based on prefix matching - partial matches shouldn't work
-        assert!(!super::supports_vision_for_model("my-claude-model"));
-        assert!(!super::supports_vision_for_model("custom-gpt-4o-wrapper"));
-        assert!(!super::supports_vision_for_model("not-gemini-model"));
+        assert!(!supports_vision_for_model("my-claude-model"));
+        assert!(!supports_vision_for_model("custom-gpt-4o-wrapper"));
+        assert!(!supports_vision_for_model("not-gemini-model"));
     }
 }

@@ -16,10 +16,10 @@ use {
 
 use {
     super::openai_compat::{
-        SseLineResult, StreamingToolState, finalize_stream, parse_tool_calls,
-        process_openai_sse_line, to_openai_tools,
+        SseLineResult, StreamingToolState, finalize_stream, parse_openai_compat_usage_from_payload,
+        parse_tool_calls, process_openai_sse_line, to_openai_tools,
     },
-    crate::model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent, Usage},
+    crate::model::{ChatMessage, CompletionResponse, LlmProvider, StreamEvent},
 };
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -235,13 +235,26 @@ impl LlmProvider for KimiCodeProvider {
 
         let status = http_resp.status();
         if !status.is_success() {
+            let retry_after_ms = super::retry_after_ms_from_headers(http_resp.headers());
             let body_text = http_resp.text().await.unwrap_or_default();
             warn!(status = %status, body = %body_text, "kimi-code API error");
             let hint = build_access_denied_hint(status, &body_text);
             if let Some(hint) = hint {
-                anyhow::bail!("Kimi Code API error HTTP {status}: {body_text} ({hint})");
+                anyhow::bail!(
+                    "{}",
+                    super::with_retry_after_marker(
+                        format!("Kimi Code API error HTTP {status}: {body_text} ({hint})"),
+                        retry_after_ms,
+                    )
+                );
             }
-            anyhow::bail!("Kimi Code API error HTTP {status}: {body_text}");
+            anyhow::bail!(
+                "{}",
+                super::with_retry_after_marker(
+                    format!("Kimi Code API error HTTP {status}: {body_text}"),
+                    retry_after_ms,
+                )
+            );
         }
 
         let resp = http_resp.json::<serde_json::Value>().await?;
@@ -252,14 +265,7 @@ impl LlmProvider for KimiCodeProvider {
         let text = message["content"].as_str().map(|s| s.to_string());
         let tool_calls = parse_tool_calls(message);
 
-        let usage = Usage {
-            input_tokens: resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-            output_tokens: resp["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
-            cache_read_tokens: resp["usage"]["prompt_tokens_details"]["cached_tokens"]
-                .as_u64()
-                .unwrap_or(0) as u32,
-            ..Default::default()
-        };
+        let usage = parse_openai_compat_usage_from_payload(&resp).unwrap_or_default();
 
         Ok(CompletionResponse {
             text,
@@ -325,6 +331,7 @@ impl LlmProvider for KimiCodeProvider {
                 Ok(r) => {
                     if let Err(e) = r.error_for_status_ref() {
                         let status = e.status().map(|s| s.as_u16()).unwrap_or(0);
+                        let retry_after_ms = super::retry_after_ms_from_headers(r.headers());
                         let body_text = r.text().await.unwrap_or_default();
                         let hint = build_access_denied_hint(
                             reqwest::StatusCode::from_u16(status)
@@ -332,9 +339,15 @@ impl LlmProvider for KimiCodeProvider {
                             &body_text,
                         );
                         if let Some(hint) = hint {
-                            yield StreamEvent::Error(format!("HTTP {status}: {body_text} ({hint})"));
+                            yield StreamEvent::Error(super::with_retry_after_marker(
+                                format!("HTTP {status}: {body_text} ({hint})"),
+                                retry_after_ms,
+                            ));
                         } else {
-                            yield StreamEvent::Error(format!("HTTP {status}: {body_text}"));
+                            yield StreamEvent::Error(super::with_retry_after_marker(
+                                format!("HTTP {status}: {body_text}"),
+                                retry_after_ms,
+                            ));
                         }
                         return;
                     }
@@ -368,13 +381,16 @@ impl LlmProvider for KimiCodeProvider {
                         continue;
                     }
 
-                    let Some(data) = line.strip_prefix("data: ") else {
+                    let Some(data) = line
+                        .strip_prefix("data: ")
+                        .or_else(|| line.strip_prefix("data:"))
+                    else {
                         continue;
                     };
 
                     match process_openai_sse_line(data, &mut state) {
                         SseLineResult::Done => {
-                            for event in finalize_stream(&state) {
+                            for event in finalize_stream(&mut state) {
                                 yield event;
                             }
                             return;
@@ -387,6 +403,32 @@ impl LlmProvider for KimiCodeProvider {
                         SseLineResult::Skip => {}
                     }
                 }
+            }
+
+            let line = buf.trim().to_string();
+            if !line.is_empty()
+                && let Some(data) = line
+                    .strip_prefix("data: ")
+                    .or_else(|| line.strip_prefix("data:"))
+            {
+                match process_openai_sse_line(data, &mut state) {
+                    SseLineResult::Done => {
+                        for event in finalize_stream(&mut state) {
+                            yield event;
+                        }
+                        return;
+                    }
+                    SseLineResult::Events(events) => {
+                        for event in events {
+                            yield event;
+                        }
+                    }
+                    SseLineResult::Skip => {}
+                }
+            }
+
+            for event in finalize_stream(&mut state) {
+                yield event;
             }
         })
     }
@@ -508,11 +550,7 @@ mod tests {
             let message = &resp["choices"][0]["message"];
             let text = message["content"].as_str().map(|s| s.to_string());
             let tool_calls = parse_tool_calls(message);
-            let usage = Usage {
-                input_tokens: resp["usage"]["prompt_tokens"].as_u64().unwrap_or(0) as u32,
-                output_tokens: resp["usage"]["completion_tokens"].as_u64().unwrap_or(0) as u32,
-                ..Default::default()
-            };
+            let usage = parse_openai_compat_usage_from_payload(&resp).unwrap_or_default();
 
             Ok(CompletionResponse {
                 text,
@@ -687,6 +725,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_parses_input_output_usage_fields() {
+        let response = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello from Kimi!"
+                }
+            }],
+            "usage": {
+                "input_tokens": 33,
+                "output_tokens": 12,
+                "cache_read_input_tokens": 4
+            }
+        });
+
+        let (base_url, _) = start_mock_with_capture(response).await;
+        let provider = mock_provider(&base_url, "kimi-k2.5");
+
+        let messages = vec![serde_json::json!({"role": "user", "content": "hi"})];
+        let resp = provider.complete(&messages, &[]).await.unwrap();
+        assert_eq!(resp.usage.input_tokens, 33);
+        assert_eq!(resp.usage.output_tokens, 12);
+        assert_eq!(resp.usage.cache_read_tokens, 4);
+    }
+
+    #[tokio::test]
     async fn complete_parses_tool_call_response() {
         let response = serde_json::json!({
             "choices": [{
@@ -723,7 +787,7 @@ mod tests {
             "/chat/completions",
             post(|| async {
                 (
-                    axum::http::StatusCode::BAD_REQUEST,
+                    http::StatusCode::BAD_REQUEST,
                     "bad request: missing something",
                 )
             }),

@@ -74,6 +74,20 @@ packages = [
 When you modify the packages list and restart, Moltis automatically rebuilds the sandbox image with a new tag.
 ```
 
+## Chat Message Queue
+
+When a new message arrives while an agent run is already active, Moltis can either
+replay queued messages one-by-one or merge them into a single follow-up message.
+
+```toml
+[chat]
+message_queue_mode = "followup"  # Default: one-by-one replay
+
+# Options:
+#   "followup" - Queue each message and run them sequentially
+#   "collect"  - Merge queued text and run once after the active run
+```
+
 ## Memory System
 
 Long-term memory uses embeddings for semantic search:
@@ -184,6 +198,30 @@ mode = "serve"                  # "serve" (private) or "funnel" (public)
 [telemetry]
 enabled = true
 otlp_endpoint = "http://localhost:4317"  # OpenTelemetry collector
+```
+
+## Process Environment Variables (`[env]`)
+
+The `[env]` section injects variables into the Moltis process at startup.
+This is useful in Docker deployments where passing individual `-e` flags is
+inconvenient, or when you want API keys stored in the config file rather
+than the host environment.
+
+```toml
+[env]
+BRAVE_API_KEY = "your-brave-key"
+OPENROUTER_API_KEY = "sk-or-..."
+ELEVENLABS_API_KEY = "..."
+```
+
+**Precedence**: existing process environment variables are never overwritten.
+If `BRAVE_API_KEY` is already set via `docker -e` or the host shell, the
+`[env]` value is skipped. This means `docker -e` always wins.
+
+```admonish info title="Settings UI vs [env]"
+Environment variables configured through the Settings UI (Settings >
+Environment) are also injected into the Moltis process at startup.
+Precedence: host/`docker -e` > config `[env]` > Settings UI.
 ```
 
 ## Environment Variables

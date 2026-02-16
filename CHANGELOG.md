@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- OAuth 2.1 support for remote MCP servers — automatic discovery (RFC 9728/8414), dynamic client registration (RFC 7591), PKCE authorization code flow, and Bearer token injection with 401 retry
+- `McpOAuthOverride` config option for servers that don't implement standard OAuth discovery
+- `mcp.reauth` RPC method to manually trigger re-authentication for a server
+- Persistent storage of dynamic client registrations at `~/.config/moltis/mcp_oauth_registrations.json`
+- Slack channel integration via Socket Mode (`moltis-slack`), including access control, OTP self-approval, thread-aware routing, and edit-in-place streaming replies
+- **SSRF allowlist**: `tools.web.fetch.ssrf_allowlist` config field to exempt trusted
+  CIDR ranges from SSRF blocking, enabling Docker inter-container networking.
+- Memory config: add `memory.disable_rag` to force keyword-only memory search while keeping markdown indexing and memory tools enabled
+- Generic OpenAI-compatible provider support: connect any OpenAI-compatible endpoint via the provider setup UI, with domain-derived naming (`custom-` prefix), model auto-discovery, and full model selection
 ### Changed
 
 ### Deprecated
@@ -16,6 +25,226 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Fixed
+
+- **Telegram queued replies**: route channel reply targets per queued message so
+  `chat.message_queue_mode = "followup"` delivers replies one-by-one instead of
+  collapsing queued channel replies into a single batch delivery.
+- **Queue mode default**: make one-by-one replay (`followup`) explicit as the
+  `ChatConfig` default, with config-level tests to prevent regressions.
+- MCP OAuth dynamic registration now uses the exact loopback callback URI selected for the current auth flow, improving compatibility with providers that require strict redirect URI matching (for example Linear).
+- MCP manager now applies `[mcp.servers.<name>.oauth]` override settings when building the OAuth provider for SSE servers.
+- Streamable HTTP MCP transport now persists and reuses `Mcp-Session-Id`, parses `text/event-stream` responses, and sends best-effort `DELETE` on shutdown to close server sessions.
+- MCP docs/config examples now use the current table-based config shape and `/mcp` endpoint examples for remote servers.
+- Memory embeddings endpoint composition now avoids duplicated path segments like `/v1/v1/embeddings` and accepts base URLs ending in host-only, `/v1`, versioned paths (for example `/v4`), or `/embeddings`
+### Security
+
+## [0.8.35] - 2026-02-15
+
+
+### Added
+
+- Add memory target routing guidance to `memory_save` prompt hint — core facts go to MEMORY.md, everything else to `memory/<topic>.md` to keep context lean
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.8.34] - 2026-02-15
+
+
+### Added
+
+- Add explicit `memory_save` hint in system prompt so weaker models (MiniMax, etc.) call the tool when asked to remember something
+- Add anchor text after memory content so models don't ignore known facts when `memory_search` returns empty
+- Add `zai` to default offered providers in config template
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.8.33] - 2026-02-15
+
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **CI**: remove unnecessary `std::path::` qualification in gateway server flagged
+  by nightly clippy.
+
+### Security
+
+## [0.8.32] - 2026-02-15
+
+
+### Added
+
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **CI**: gate macOS-only sandbox helper functions with `#[cfg]` to fix dead-code
+  errors on Linux CI.
+
+### Security
+
+## [0.8.31] - 2026-02-15
+
+
+### Added
+
+- **Sandbox toggle notification**: when the sandbox is enabled or disabled
+  mid-session, a system message is injected into the conversation history so
+  the LLM knows the execution environment changed. A chat notice also appears
+  in the UI immediately.
+
+- **Config `[env]` section**: environment variables defined in `[env]` in
+  `moltis.toml` are injected into the Moltis process at startup. This makes
+  API keys (Brave, OpenRouter, etc.) available to features that read from
+  `std::env::var()`. Process env vars (`docker -e`, host env) take precedence.
+  Closes #107.
+- **Browser auto-detection and install**: automatically detect all installed
+  Chromium-family browsers (Chrome, Chromium, Edge, Brave, Opera, Vivaldi, Arc)
+  and auto-install via the system package manager when none is found. Requests
+  can specify a preferred browser (`"browser": "brave"`) or let the system
+  pick the first available one.
+- **Z.AI provider**: add Z.AI (Zhipu) as an OpenAI-compatible provider with
+  static model catalog (GLM-5, GLM-4.7, GLM-4.6, GLM-4.5 series) and dynamic
+  model discovery via `/models` endpoint. Supports tool calling, streaming,
+  vision (GLM-4.6V/4.5V), and reasoning content.
+- **Running Containers panel**: the Settings > Sandboxes page now shows a
+  "Running Containers" section listing all moltis-managed containers with
+  live state (running/stopped/exited), backend type (Apple Container/Docker),
+  resource info, and Stop/Delete actions. Includes disk usage display
+  (container/image counts, sizes, reclaimable space) and a "Clean All"
+  button to stop and remove all stale containers at once.
+- **Startup container GC**: the gateway now automatically removes orphaned
+  session containers on startup, preventing disk space accumulation from
+  crashed or interrupted sessions.
+- **Download full context as JSONL**: the full context panel now has a
+  "Download" button that exports the conversation (including raw LLM
+  responses) as a timestamped `.jsonl` file.
+- **Sandbox images in cached images list**: the Settings > Images page
+  now merges sandbox-built images into the cached images list so all
+  container images are visible in one place.
+
+### Changed
+
+- **Sandbox image identity**: image tags now use SHA-256 instead of
+  `DefaultHasher` for deterministic, cross-run hashing of base image +
+  packages.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **Thinking indicator lost on reload**: reloading the page while the model
+  was generating no longer loses the "thinking" dots. The backend now includes
+  `replying` state in `sessions.list` and `sessions.switch` RPC responses so
+  the frontend can restore the indicator after a full page reload.
+- **Thinking text restored after reload**: reloading the page during extended
+  thinking (reasoning) now restores the accumulated thinking text instead of
+  showing only bouncing dots. The backend tracks thinking text per session and
+  returns it in the `sessions.switch` response.
+- **Apple Container recovery**: simplify container recovery to a single flat
+  retry loop (3 attempts max, down from up to 24). Name rotation now only
+  triggers on `AlreadyExists` errors, preventing orphan containers. Added
+  `notFound` error matching so exec readiness probes retry correctly.
+  Diagnostic info (running container count, service health, container logs)
+  is now included in failure messages. Detect stale Virtualization.framework
+  state (`NSPOSIXErrorDomain EINVAL`) and automatically restart the daemon
+  (`container system stop && container system start`) before retrying; bail
+  with a clear remediation message only if automatic restart fails.
+  Exec-level recovery retries reduced from 3 to 1.
+- **Ghost Apple Containers**: failed container deletions are now tracked
+  in a zombie set and filtered from list output, preventing stale entries
+  from reappearing in the Running Containers panel.
+- **Container action errors preserved**: failed delete/clean/restart
+  operations now surface the original error message to the UI instead of
+  silently swallowing it.
+- **Usage parsing across OpenAI-compatible providers**: token counts now
+  handle Anthropic-style (`input_tokens`/`output_tokens`), camelCase
+  variants, cache token fields, and multiple response nesting structures
+  across diverse providers.
+- **Think tag whitespace**: leading whitespace after `</think>` close
+  tags is now stripped, preventing extra blank lines in streamed output.
+- **Token bar visible at zero**: the token usage bar no longer disappears
+  when all counts are zero; it stays visible as a baseline indicator.
+
+### Security
+
+## [0.8.30] - 2026-02-15
+
+
+### Added
+
+### Changed
+
+- **Assistant reasoning persistence**: conversation reasoning is now persisted
+  in assistant messages and shared snapshots so resumed sessions retain
+  reasoning context instead of dropping it after refresh/share operations.
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.8.29] - 2026-02-14
+
+
+### Added
+
+- **Memory bootstrap**: inject `MEMORY.md` content directly into the system
+  prompt (truncated at 20,000 chars) so the agent always has core memory
+  available without needing to call `memory_search` first. Matches OpenClaw's
+  bootstrap behavior
+- **Memory save tool**: new `memory_save` tool lets the LLM write to long-term
+  memory files (`MEMORY.md` or `memory/<name>.md`) with append/overwrite modes
+  and immediate re-indexing for search
+
+### Changed
+
+- **Memory writing**: `MemoryManager` now implements the `MemoryWriter` trait
+  directly, unifying read and write paths behind a single manager. The silent
+  memory turn and `MemorySaveTool` both delegate to the manager, which handles
+  path validation, size limits, and automatic re-indexing after writes
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+- **Memory file watcher**: the file watcher now covers `MEMORY.md` at the data
+  directory root, which was previously excluded because the filter only matched
+  directories
 
 ### Security
 
@@ -131,7 +360,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Added
-
 - **Multi-select preferred models per provider**: The LLMs page now has a
   "Preferred Models" button per provider that opens a multi-select modal.
   Selected models are pinned at the top of the session model dropdown.
@@ -176,6 +404,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Instead, the backend exposes a `keyOptional` field on provider
   metadata, making the UI provider-agnostic.
 
+### Fixed
+
+- **Settings UI env vars now available process-wide**: environment variables
+  set via Settings > Environment were previously only injected into sandbox
+  commands. They are now also injected into the Moltis process at startup,
+  making them available to web search, embeddings, and provider API calls.
 ## [0.8.14] - 2026-02-11
 
 ### Security

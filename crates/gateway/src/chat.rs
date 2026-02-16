@@ -81,7 +81,7 @@ fn to_user_content(mc: &MessageContent) -> UserContent {
                         },
                         None => {
                             warn!(
-                                url_prefix = &image_url.url[..image_url.url.len().min(80)],
+                                url_prefix = truncate_at_char_boundary(&image_url.url, 80),
                                 "to_user_content: failed to parse data URI, dropping image"
                             );
                             None
@@ -113,6 +113,11 @@ fn to_user_content(mc: &MessageContent) -> UserContent {
 enum ReplyMedium {
     Text,
     Voice,
+}
+
+#[must_use]
+fn truncate_at_char_boundary(text: &str, max_bytes: usize) -> &str {
+    &text[..text.floor_char_boundary(max_bytes)]
 }
 
 #[derive(Debug, Deserialize)]
@@ -161,6 +166,10 @@ struct ChatFinalBroadcast {
     #[serde(skip_serializing_if = "Option::is_none")]
     audio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    audio_warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     seq: Option<u64>,
 }
 
@@ -171,9 +180,18 @@ struct ChatErrorBroadcast {
     run_id: String,
     session_key: String,
     state: &'static str,
-    error: serde_json::Value,
+    error: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     seq: Option<u64>,
+}
+
+struct AssistantTurnOutput {
+    text: String,
+    input_tokens: u32,
+    output_tokens: u32,
+    audio_path: Option<String>,
+    reasoning: Option<String>,
+    llm_api_response: Option<Value>,
 }
 
 fn now_ms() -> u64 {
@@ -481,11 +499,8 @@ async fn run_single_probe(
     }
 
     let probe = [ChatMessage::user("ping")];
-    let completion = tokio::time::timeout(
-        std::time::Duration::from_secs(20),
-        provider.complete(&probe, &[]),
-    )
-    .await;
+    let completion =
+        tokio::time::timeout(Duration::from_secs(20), provider.complete(&probe, &[])).await;
 
     match completion {
         Ok(Ok(_)) => {
@@ -499,8 +514,7 @@ async fn run_single_probe(
         },
         Ok(Err(err)) => {
             let error_text = err.to_string();
-            let error_obj =
-                crate::chat_error::parse_chat_error(&error_text, Some(provider_name.as_str()));
+            let error_obj = parse_chat_error(&error_text, Some(provider_name.as_str()));
             if is_probe_rate_limited_error(&error_obj, &error_text) {
                 let backoff = rate_limiter.mark_rate_limited(&provider_name).await;
                 let detail = error_obj
@@ -730,6 +744,7 @@ struct PromptPersona {
     soul_text: Option<String>,
     agents_text: Option<String>,
     tools_text: Option<String>,
+    memory_text: Option<String>,
 }
 
 /// Load identity, user profile, soul, and workspace text from config + data files.
@@ -769,6 +784,7 @@ fn load_prompt_persona() -> PromptPersona {
         soul_text: moltis_config::load_soul(),
         agents_text: moltis_config::load_agents_md(),
         tools_text: moltis_config::load_tools_md(),
+        memory_text: moltis_config::load_memory_md(),
     }
 }
 
@@ -1190,8 +1206,7 @@ impl ModelService for LiveModelService {
                 .filter(|m| !disabled.is_disabled(&m.id))
                 .filter(|m| disabled.unsupported_info(&m.id).is_none()),
         );
-        let model_ids: Vec<String> = prioritized.iter().map(|m| m.id.clone()).collect();
-        info!(model_count = model_ids.len(), model_ids = ?model_ids, "models.list response");
+        info!(model_count = prioritized.len(), "models.list response");
         let models: Vec<_> = prioritized
             .iter()
             .copied()
@@ -1225,12 +1240,7 @@ impl ModelService for LiveModelService {
                 .iter()
                 .filter(|m| moltis_agents::providers::is_chat_capable_model(&m.id)),
         );
-        let model_ids: Vec<String> = prioritized.iter().map(|m| m.id.clone()).collect();
-        info!(
-            model_count = model_ids.len(),
-            model_ids = ?model_ids,
-            "models.list_all response"
-        );
+        info!(model_count = prioritized.len(), "models.list_all response");
         let models: Vec<_> = prioritized
             .iter()
             .copied()
@@ -1674,6 +1684,8 @@ impl ModelService for LiveModelService {
                 return Err(format!("unknown model: {model_id}{suggestion_hint}"));
             }
         };
+        let started = Instant::now();
+        info!(model_id, provider = provider.name(), "model probe started");
 
         // Use streaming and return as soon as the first token arrives.
         // Dropping the stream closes the HTTP connection, which tells the
@@ -1681,7 +1693,7 @@ impl ModelService for LiveModelService {
         let probe = vec![ChatMessage::user("ping")];
         let mut stream = provider.stream(probe);
 
-        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
             while let Some(event) = stream.next().await {
                 match event {
                     StreamEvent::Delta(_) | StreamEvent::Done(_) => return Ok(()),
@@ -1699,25 +1711,41 @@ impl ModelService for LiveModelService {
 
         match result {
             Ok(Ok(())) => {
-                info!(model_id, "model probe succeeded");
+                info!(
+                    model_id,
+                    provider = provider.name(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "model probe succeeded"
+                );
                 Ok(serde_json::json!({
                     "ok": true,
                     "modelId": model_id,
                 }))
             },
             Ok(Err(err)) => {
-                let error_obj = crate::chat_error::parse_chat_error(&err, Some(provider.name()));
+                let error_obj = parse_chat_error(&err, Some(provider.name()));
                 let detail = error_obj
                     .get("detail")
                     .and_then(|v| v.as_str())
                     .unwrap_or(&err)
                     .to_string();
 
-                warn!(model_id, error = %detail, "model probe failed");
+                warn!(
+                    model_id,
+                    provider = provider.name(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    error = %detail,
+                    "model probe failed"
+                );
                 Err(detail)
             },
             Err(_) => {
-                warn!(model_id, "model probe timed out after 10s");
+                warn!(
+                    model_id,
+                    provider = provider.name(),
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "model probe timed out after 10s"
+                );
                 Err("Connection timed out after 10 seconds".to_string())
             },
         }
@@ -1737,6 +1765,7 @@ pub struct LiveChatService {
     model_store: Arc<RwLock<DisabledModelsStore>>,
     state: Arc<GatewayState>,
     active_runs: Arc<RwLock<HashMap<String, AbortHandle>>>,
+    active_runs_by_session: Arc<RwLock<HashMap<String, String>>>,
     tool_registry: Arc<RwLock<ToolRegistry>>,
     session_store: Arc<SessionStore>,
     session_metadata: Arc<SqliteSessionMetadata>,
@@ -1747,6 +1776,12 @@ pub struct LiveChatService {
     message_queue: Arc<RwLock<HashMap<String, Vec<QueuedMessage>>>>,
     /// Per-session last-seen client sequence number for ordering diagnostics.
     last_client_seq: Arc<RwLock<HashMap<String, u64>>>,
+    /// Per-session accumulated thinking text for active runs, so it can be
+    /// returned in `sessions.switch` after a page reload.
+    active_thinking_text: Arc<RwLock<HashMap<String, String>>>,
+    /// Per-session reply medium for active runs, so the frontend can restore
+    /// `voicePending` state after a page reload.
+    active_reply_medium: Arc<RwLock<HashMap<String, ReplyMedium>>>,
     /// Failover configuration for automatic model/provider failover.
     failover_config: moltis_config::schema::FailoverConfig,
 }
@@ -1764,6 +1799,7 @@ impl LiveChatService {
             model_store,
             state,
             active_runs: Arc::new(RwLock::new(HashMap::new())),
+            active_runs_by_session: Arc::new(RwLock::new(HashMap::new())),
             tool_registry: Arc::new(RwLock::new(ToolRegistry::new())),
             session_store,
             session_metadata,
@@ -1771,6 +1807,8 @@ impl LiveChatService {
             session_locks: Arc::new(RwLock::new(HashMap::new())),
             message_queue: Arc::new(RwLock::new(HashMap::new())),
             last_client_seq: Arc::new(RwLock::new(HashMap::new())),
+            active_thinking_text: Arc::new(RwLock::new(HashMap::new())),
+            active_reply_medium: Arc::new(RwLock::new(HashMap::new())),
             failover_config: moltis_config::schema::FailoverConfig::default(),
         }
     }
@@ -1831,11 +1869,47 @@ impl LiveChatService {
         )
     }
 
+    async fn abort_run_handle(
+        active_runs: &Arc<RwLock<HashMap<String, AbortHandle>>>,
+        active_runs_by_session: &Arc<RwLock<HashMap<String, String>>>,
+        run_id: Option<&str>,
+        session_key: Option<&str>,
+    ) -> (Option<String>, bool) {
+        let resolved_run_id = if let Some(id) = run_id {
+            Some(id.to_string())
+        } else if let Some(key) = session_key {
+            active_runs_by_session.read().await.get(key).cloned()
+        } else {
+            None
+        };
+
+        let Some(target_run_id) = resolved_run_id.clone() else {
+            return (None, false);
+        };
+
+        let aborted = if let Some(handle) = active_runs.write().await.remove(&target_run_id) {
+            handle.abort();
+            true
+        } else {
+            false
+        };
+
+        let mut by_session = active_runs_by_session.write().await;
+        if let Some(key) = session_key
+            && by_session.get(key).is_some_and(|id| id == &target_run_id)
+        {
+            by_session.remove(key);
+        }
+        by_session.retain(|_, id| id != &target_run_id);
+
+        (resolved_run_id, aborted)
+    }
+
     /// Resolve a provider from session metadata, history, or first registered.
     async fn resolve_provider(
         &self,
         session_key: &str,
-        history: &[serde_json::Value],
+        history: &[Value],
     ) -> Result<Arc<dyn moltis_agents::model::LlmProvider>, String> {
         let reg = self.providers.read().await;
         let session_model = self
@@ -1931,7 +2005,7 @@ impl LiveChatService {
 
 #[async_trait]
 impl ChatService for LiveChatService {
-    async fn send(&self, params: Value) -> ServiceResult {
+    async fn send(&self, mut params: Value) -> ServiceResult {
         // Support both text-only and multimodal content.
         // - "text": string → plain text message
         // - "content": array → multimodal content (text + images)
@@ -2184,9 +2258,9 @@ impl ChatService for LiveChatService {
             .touch(&session_key, history.len() as u32)
             .await;
 
-        // If this is a web UI message on a channel-bound session, echo the
-        // user message to the channel and register a reply target so the LLM
-        // response is also delivered there.
+        // If this is a web UI message on a channel-bound session, attach the
+        // channel reply target so the run-start path can route the final
+        // response back to the channel.
         let is_web_message = conn_id.is_some()
             && params.get("_session_key").is_none()
             && params.get("channel").is_none();
@@ -2210,12 +2284,38 @@ impl ChatService for LiveChatService {
                 .unwrap_or(true);
 
             if is_active {
-                // Push reply target so deliver_channel_replies sends the LLM response.
-                self.state
-                    .push_channel_reply(&session_key, target.clone())
-                    .await;
+                match serde_json::to_value(&target) {
+                    Ok(target_val) => {
+                        params["_channel_reply_target"] = target_val;
+                    },
+                    Err(e) => {
+                        warn!(
+                            session = %session_key,
+                            error = %e,
+                            "failed to serialize channel reply target"
+                        );
+                    },
+                }
             }
         }
+
+        let deferred_channel_target =
+            params
+                .get("_channel_reply_target")
+                .cloned()
+                .and_then(|value| {
+                    match serde_json::from_value::<moltis_channels::ChannelReplyTarget>(value) {
+                        Ok(target) => Some(target),
+                        Err(e) => {
+                            warn!(
+                                session = %session_key,
+                                error = %e,
+                                "ignoring invalid _channel_reply_target"
+                            );
+                            None
+                        },
+                    }
+                });
 
         // Discover enabled skills/plugins for prompt injection.
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
@@ -2259,6 +2359,9 @@ impl ChatService for LiveChatService {
 
         let state = Arc::clone(&self.state);
         let active_runs = Arc::clone(&self.active_runs);
+        let active_runs_by_session = Arc::clone(&self.active_runs_by_session);
+        let active_thinking_text = Arc::clone(&self.active_thinking_text);
+        let active_reply_medium = Arc::clone(&self.active_reply_medium);
         let run_id_clone = run_id.clone();
         let tool_registry = Arc::clone(&self.tool_registry);
         let hook_registry = self.hook_registry.clone();
@@ -2448,10 +2551,20 @@ impl ChatService for LiveChatService {
 
         let message_queue = Arc::clone(&self.message_queue);
         let state_for_drain = Arc::clone(&self.state);
+        let deferred_channel_target = deferred_channel_target.clone();
 
         let handle = tokio::spawn(async move {
             let permit = permit; // hold permit until agent run completes
             let ctx_ref = project_context.as_deref();
+            if let Some(target) = deferred_channel_target {
+                // Register the channel reply target only after we own the
+                // session permit, so queued messages keep per-message routing.
+                state.push_channel_reply(&session_key_clone, target).await;
+            }
+            active_reply_medium
+                .write()
+                .await
+                .insert(session_key_clone.clone(), desired_reply_medium);
             if desired_reply_medium == ReplyMedium::Voice {
                 broadcast(
                     &state,
@@ -2509,17 +2622,14 @@ impl ChatService for LiveChatService {
                         Some(&session_store),
                         mcp_disabled,
                         client_seq,
+                        Some(Arc::clone(&active_thinking_text)),
                     )
                     .await
                 }
             };
 
             let assistant_text = if agent_timeout_secs > 0 {
-                match tokio::time::timeout(
-                    std::time::Duration::from_secs(agent_timeout_secs),
-                    agent_fut,
-                )
-                .await
+                match tokio::time::timeout(Duration::from_secs(agent_timeout_secs), agent_fut).await
                 {
                     Ok(result) => result,
                     Err(_) => {
@@ -2529,12 +2639,13 @@ impl ChatService for LiveChatService {
                             timeout_secs = agent_timeout_secs,
                             "agent run timed out"
                         );
+                        let detail = format!("Agent run timed out after {agent_timeout_secs}s");
                         let error_obj = serde_json::json!({
                             "type": "timeout",
-                            "message": format!(
-                                "Agent run timed out after {agent_timeout_secs}s"
-                            ),
+                            "title": "Timed out",
+                            "detail": detail,
                         });
+                        deliver_channel_error(&state, &session_key_clone, &error_obj).await;
                         broadcast(
                             &state,
                             "chat",
@@ -2555,16 +2666,18 @@ impl ChatService for LiveChatService {
             };
 
             // Persist assistant response (even empty ones — needed for LLM history coherence).
-            if let Some((response_text, input_tokens, output_tokens, audio_path)) = assistant_text {
+            if let Some(assistant_output) = assistant_text {
                 let assistant_msg = PersistedMessage::Assistant {
-                    content: response_text,
+                    content: assistant_output.text,
                     created_at: Some(now_ms()),
                     model: Some(model_id.clone()),
                     provider: Some(provider_name.clone()),
-                    input_tokens: Some(input_tokens),
-                    output_tokens: Some(output_tokens),
+                    input_tokens: Some(assistant_output.input_tokens),
+                    output_tokens: Some(assistant_output.output_tokens),
                     tool_calls: None,
-                    audio: audio_path,
+                    reasoning: assistant_output.reasoning,
+                    llm_api_response: assistant_output.llm_api_response,
+                    audio: assistant_output.audio_path,
                     seq: client_seq,
                     run_id: Some(run_id_clone.clone()),
                 };
@@ -2581,6 +2694,16 @@ impl ChatService for LiveChatService {
             }
 
             active_runs.write().await.remove(&run_id_clone);
+            let mut runs_by_session = active_runs_by_session.write().await;
+            if runs_by_session.get(&session_key_clone) == Some(&run_id_clone) {
+                runs_by_session.remove(&session_key_clone);
+            }
+            drop(runs_by_session);
+            active_thinking_text
+                .write()
+                .await
+                .remove(&session_key_clone);
+            active_reply_medium.write().await.remove(&session_key_clone);
 
             // Release the semaphore *before* draining so replayed sends can
             // acquire it. Without this, every replayed `chat.send()` would
@@ -2651,6 +2774,10 @@ impl ChatService for LiveChatService {
             .write()
             .await
             .insert(run_id.clone(), handle.abort_handle());
+        self.active_runs_by_session
+            .write()
+            .await
+            .insert(session_key.clone(), run_id.clone());
 
         Ok(serde_json::json!({ "runId": run_id }))
     }
@@ -2805,21 +2932,24 @@ impl ChatService for LiveChatService {
                 Some(&self.session_store),
                 false, // send_sync: MCP tools always enabled for API calls
                 None,  // send_sync: no client seq
+                None,  // send_sync: no thinking text tracking
             )
             .await
         };
 
         // Persist assistant response (even empty ones — needed for LLM history coherence).
-        if let Some((ref response_text, input_tokens, output_tokens, ref audio_path)) = result {
+        if let Some(ref assistant_output) = result {
             let assistant_msg = PersistedMessage::Assistant {
-                content: response_text.clone(),
+                content: assistant_output.text.clone(),
                 created_at: Some(now_ms()),
                 model: Some(model_id.clone()),
                 provider: Some(provider_name.clone()),
-                input_tokens: Some(input_tokens),
-                output_tokens: Some(output_tokens),
+                input_tokens: Some(assistant_output.input_tokens),
+                output_tokens: Some(assistant_output.output_tokens),
                 tool_calls: None,
-                audio: audio_path.clone(),
+                reasoning: assistant_output.reasoning.clone(),
+                llm_api_response: assistant_output.llm_api_response.clone(),
+                audio: assistant_output.audio_path.clone(),
                 seq: None,
                 run_id: Some(run_id.clone()),
             };
@@ -2837,13 +2967,11 @@ impl ChatService for LiveChatService {
         }
 
         match result {
-            Some((response_text, input_tokens, output_tokens, _audio_path)) => {
-                Ok(serde_json::json!({
-                    "text": response_text,
-                    "inputTokens": input_tokens,
-                    "outputTokens": output_tokens,
-                }))
-            },
+            Some(assistant_output) => Ok(serde_json::json!({
+                "text": assistant_output.text,
+                "inputTokens": assistant_output.input_tokens,
+                "outputTokens": assistant_output.output_tokens,
+            })),
             None => {
                 // Check the last broadcast for this run to get the actual error message.
                 let error_msg = state
@@ -2868,15 +2996,27 @@ impl ChatService for LiveChatService {
     }
 
     async fn abort(&self, params: Value) -> ServiceResult {
-        let run_id = params
-            .get("runId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| "missing 'runId'".to_string())?;
-
-        if let Some(handle) = self.active_runs.write().await.remove(run_id) {
-            handle.abort();
+        let run_id = params.get("runId").and_then(|v| v.as_str());
+        let session_key = params.get("sessionKey").and_then(|v| v.as_str());
+        if run_id.is_none() && session_key.is_none() {
+            return Err("missing 'runId' or 'sessionKey'".to_string());
         }
-        Ok(serde_json::json!({}))
+
+        let (resolved_run_id, aborted) = Self::abort_run_handle(
+            &self.active_runs,
+            &self.active_runs_by_session,
+            run_id,
+            session_key,
+        )
+        .await;
+        info!(
+            requested_run_id = ?run_id,
+            session_key = ?session_key,
+            resolved_run_id = ?resolved_run_id,
+            aborted,
+            "chat.abort"
+        );
+        Ok(serde_json::json!({ "aborted": aborted, "runId": resolved_run_id }))
     }
 
     async fn cancel_queued(&self, params: Value) -> ServiceResult {
@@ -3017,33 +3157,29 @@ impl ChatService for LiveChatService {
         }
 
         // Run silent memory turn before summarization — saves important memories to disk.
-        // Write into the data directory (e.g. ~/.moltis/) so files don't end up in cwd.
-        if let Some(ref mm) = self.state.memory_manager {
-            let memory_dir = moltis_config::data_dir();
-            if let Ok(provider) = self.resolve_provider(&session_key, &history).await {
-                let chat_history_for_memory = values_to_chat_messages(&history);
-                match moltis_agents::silent_turn::run_silent_memory_turn(
-                    provider,
-                    &chat_history_for_memory,
-                    &memory_dir,
-                )
-                .await
-                {
-                    Ok(paths) => {
-                        for path in &paths {
-                            if let Err(e) = mm.sync_path(path).await {
-                                warn!(path = %path.display(), error = %e, "compact: memory sync of written file failed");
-                            }
-                        }
-                        if !paths.is_empty() {
-                            info!(
-                                files = paths.len(),
-                                "compact: silent memory turn wrote files"
-                            );
-                        }
-                    },
-                    Err(e) => warn!(error = %e, "compact: silent memory turn failed"),
-                }
+        // The manager implements MemoryWriter directly (with path validation, size limits,
+        // and automatic re-indexing), so no manual sync_path is needed after the turn.
+        if let Some(ref mm) = self.state.memory_manager
+            && let Ok(provider) = self.resolve_provider(&session_key, &history).await
+        {
+            let chat_history_for_memory = values_to_chat_messages(&history);
+            let writer: Arc<dyn moltis_agents::memory_writer::MemoryWriter> = Arc::clone(mm) as _;
+            match moltis_agents::silent_turn::run_silent_memory_turn(
+                provider,
+                &chat_history_for_memory,
+                writer,
+            )
+            .await
+            {
+                Ok(paths) => {
+                    if !paths.is_empty() {
+                        info!(
+                            files = paths.len(),
+                            "compact: silent memory turn wrote files"
+                        );
+                    }
+                },
+                Err(e) => warn!(error = %e, "compact: silent memory turn failed"),
             }
         }
 
@@ -3075,7 +3211,12 @@ impl ChatService for LiveChatService {
                 // Tool events not expected in summarization stream.
                 StreamEvent::ToolCallStart { .. }
                 | StreamEvent::ToolCallArgumentsDelta { .. }
-                | StreamEvent::ToolCallComplete { .. } => {},
+                | StreamEvent::ToolCallComplete { .. }
+                // Provider raw payloads are debug metadata, not summary text.
+                | StreamEvent::ProviderRaw(_)
+                // Ignore provider reasoning blocks; summary body should only
+                // include final answer text.
+                | StreamEvent::ReasoningDelta(_) => {},
             }
         }
 
@@ -3092,6 +3233,8 @@ impl ChatService for LiveChatService {
             input_tokens: None,
             output_tokens: None,
             tool_calls: None,
+            reasoning: None,
+            llm_api_response: None,
             audio: None,
             seq: None,
             run_id: None,
@@ -3249,7 +3392,7 @@ impl ChatService for LiveChatService {
             .and_then(|e| e.mcp_disabled)
             .unwrap_or(false);
         let config = moltis_config::discover_and_load();
-        let tools: Vec<serde_json::Value> = if supports_tools {
+        let tools: Vec<Value> = if supports_tools {
             let registry_guard = self.tool_registry.read().await;
             let effective_registry =
                 apply_runtime_tool_filters(&registry_guard, &config, &[], mcp_disabled);
@@ -3331,7 +3474,7 @@ impl ChatService for LiveChatService {
         };
 
         // Discover enabled skills/plugins (only if provider supports tools)
-        let skills_list: Vec<serde_json::Value> = if supports_tools {
+        let skills_list: Vec<Value> = if supports_tools {
             let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
             let discoverer = moltis_skills::discover::FsSkillDiscoverer::new(search_paths);
             match discoverer.discover().await {
@@ -3485,6 +3628,7 @@ impl ChatService for LiveChatService {
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
+                persona.memory_text.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -3495,6 +3639,7 @@ impl ChatService for LiveChatService {
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
+                persona.memory_text.as_deref(),
             )
         };
 
@@ -3612,6 +3757,7 @@ impl ChatService for LiveChatService {
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
+                persona.memory_text.as_deref(),
             )
         } else {
             build_system_prompt_minimal_runtime(
@@ -3622,10 +3768,19 @@ impl ChatService for LiveChatService {
                 persona.agents_text.as_deref(),
                 persona.tools_text.as_deref(),
                 Some(&runtime_context),
+                persona.memory_text.as_deref(),
             )
         };
 
         let system_prompt_chars = system_prompt.len();
+
+        // Keep raw assistant outputs (including provider/model/token metadata)
+        // so the UI can show a debug view of what the LLM actually returned.
+        let llm_outputs: Vec<Value> = history
+            .iter()
+            .filter(|entry| entry.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+            .cloned()
+            .collect();
 
         // Reconstruct `role: "tool"` messages from persisted `tool_result`
         // entries so the context view shows what the LLM actually saw.
@@ -3669,10 +3824,36 @@ impl ChatService for LiveChatService {
 
         Ok(serde_json::json!({
             "messages": openai_messages,
+            "llmOutputs": llm_outputs,
             "messageCount": message_count,
             "systemPromptChars": system_prompt_chars,
             "totalChars": total_chars,
         }))
+    }
+
+    async fn active_session_keys(&self) -> Vec<String> {
+        self.active_runs_by_session
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    async fn active_thinking_text(&self, session_key: &str) -> Option<String> {
+        self.active_thinking_text
+            .read()
+            .await
+            .get(session_key)
+            .cloned()
+    }
+
+    async fn active_voice_pending(&self, session_key: &str) -> bool {
+        self.active_reply_medium
+            .read()
+            .await
+            .get(session_key)
+            .is_some_and(|m| *m == ReplyMedium::Voice)
     }
 }
 
@@ -3683,7 +3864,7 @@ async fn mark_unsupported_model(
     model_store: &Arc<RwLock<DisabledModelsStore>>,
     model_id: &str,
     provider_name: &str,
-    error_obj: &serde_json::Value,
+    error_obj: &Value,
 ) {
     if error_obj.get("type").and_then(|v| v.as_str()) != Some("unsupported_model") {
         return;
@@ -3787,7 +3968,7 @@ async fn run_with_tools(
     tool_registry: &Arc<RwLock<ToolRegistry>>,
     user_content: &UserContent,
     provider_name: &str,
-    history_raw: &[serde_json::Value],
+    history_raw: &[Value],
     session_key: &str,
     desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
@@ -3800,7 +3981,8 @@ async fn run_with_tools(
     session_store: Option<&Arc<SessionStore>>,
     mcp_disabled: bool,
     client_seq: Option<u64>,
-) -> Option<(String, u32, u32, Option<String>)> {
+    active_thinking_text: Option<Arc<RwLock<HashMap<String, String>>>>,
+) -> Option<AssistantTurnOutput> {
     let persona = load_prompt_persona();
 
     let native_tools = provider.supports_tools();
@@ -3828,6 +4010,7 @@ async fn run_with_tools(
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
             runtime_context,
+            persona.memory_text.as_deref(),
         )
     } else {
         // Minimal prompt without tools for local LLMs
@@ -3839,6 +4022,7 @@ async fn run_with_tools(
             persona.agents_text.as_deref(),
             persona.tools_text.as_deref(),
             runtime_context,
+            persona.memory_text.as_deref(),
         )
     };
 
@@ -3861,10 +4045,14 @@ async fn run_with_tools(
     let run_id_for_events = run_id.to_string();
     let session_key_for_events = session_key.to_string();
     let session_store_for_events = session_store.map(Arc::clone);
+    let provider_name_for_events = provider_name.to_string();
     let (on_event, mut event_rx) = ordered_runner_event_callback();
     let event_forwarder = tokio::spawn(async move {
         // Track tool call arguments from ToolCallStart so they can be persisted in ToolCallEnd.
         let mut tool_args_map: HashMap<String, Value> = HashMap::new();
+        // Track reasoning text that should be persisted with the first tool call after thinking.
+        let mut tool_reasoning_map: HashMap<String, String> = HashMap::new();
+        let mut latest_reasoning = String::new();
         while let Some(event) = event_rx.recv().await {
             let state = Arc::clone(&state_for_events);
             let run_id = run_id_for_events.clone();
@@ -3890,6 +4078,12 @@ async fn run_with_tools(
                     arguments,
                 } => {
                     tool_args_map.insert(id.clone(), arguments.clone());
+
+                    // Attach reasoning to the first tool call after thinking.
+                    if !latest_reasoning.is_empty() {
+                        tool_reasoning_map
+                            .insert(id.clone(), std::mem::take(&mut latest_reasoning));
+                    }
 
                     // Send tool status to channels (Telegram, etc.)
                     let state_clone = Arc::clone(&state);
@@ -3973,10 +4167,10 @@ async fn run_with_tools(
                             {
                                 let truncated = format!(
                                     "{}\n\n... [truncated — {} bytes total]",
-                                    &s[..10_000],
+                                    truncate_at_char_boundary(s, 10_000),
                                     s.len()
                                 );
-                                capped[*field] = serde_json::Value::String(truncated);
+                                capped[*field] = Value::String(truncated);
                             }
                         }
                         payload["result"] = capped;
@@ -4044,9 +4238,8 @@ async fn run_with_tools(
                                     }
                                 });
                                 let sanitized = SessionStore::key_to_filename(&sk_media);
-                                r["screenshot"] = serde_json::Value::String(format!(
-                                    "media/{sanitized}/{tool_call_id}.png"
-                                ));
+                                r["screenshot"] =
+                                    Value::String(format!("media/{sanitized}/{tool_call_id}.png"));
                             }
                             // If screenshot is still a data URI (decode failed), strip it.
                             let strip_screenshot = r
@@ -4065,21 +4258,23 @@ async fn run_with_tools(
                                 {
                                     let truncated = format!(
                                         "{}\n\n... [truncated — {} bytes total]",
-                                        &s[..10_000],
+                                        truncate_at_char_boundary(s, 10_000),
                                         s.len()
                                     );
-                                    r[*field] = serde_json::Value::String(truncated);
+                                    r[*field] = Value::String(truncated);
                                 }
                             }
                             r
                         });
-                        let tool_result_msg = PersistedMessage::tool_result(
+                        let tracked_reasoning = tool_reasoning_map.remove(&id);
+                        let tool_result_msg = PersistedMessage::tool_result_with_reasoning(
                             id,
                             name,
                             tracked_args,
                             success,
                             persisted_result,
                             error,
+                            tracked_reasoning,
                         );
                         let store_clone = Arc::clone(store);
                         let sk_persist = sk.clone();
@@ -4095,13 +4290,19 @@ async fn run_with_tools(
 
                     payload
                 },
-                RunnerEvent::ThinkingText(text) => serde_json::json!({
-                    "runId": run_id,
-                    "sessionKey": sk,
-                    "state": "thinking_text",
-                    "text": text,
-                    "seq": seq,
-                }),
+                RunnerEvent::ThinkingText(text) => {
+                    latest_reasoning = text.clone();
+                    if let Some(ref map) = active_thinking_text {
+                        map.write().await.insert(sk.clone(), text.clone());
+                    }
+                    serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": sk,
+                        "state": "thinking_text",
+                        "text": text,
+                        "seq": seq,
+                    })
+                },
                 RunnerEvent::TextDelta(text) => serde_json::json!({
                     "runId": run_id,
                     "sessionKey": sk,
@@ -4142,15 +4343,37 @@ async fn run_with_tools(
                     "toolCallsMade": tool_calls_made,
                     "seq": seq,
                 }),
-                RunnerEvent::RetryingAfterError(_) => serde_json::json!({
-                    "runId": run_id,
-                    "sessionKey": sk,
-                    "state": "retrying",
-                    "seq": seq,
-                }),
+                RunnerEvent::RetryingAfterError { error, delay_ms } => {
+                    let error_obj =
+                        parse_chat_error(&error, Some(provider_name_for_events.as_str()));
+                    if error_obj.get("type").and_then(|v| v.as_str()) == Some("rate_limit_exceeded")
+                    {
+                        let state_clone = Arc::clone(&state);
+                        let sk_clone = sk.clone();
+                        let error_clone = error_obj.clone();
+                        tokio::spawn(async move {
+                            send_retry_status_to_channels(
+                                &state_clone,
+                                &sk_clone,
+                                &error_clone,
+                                Duration::from_millis(delay_ms),
+                            )
+                            .await;
+                        });
+                    }
+                    serde_json::json!({
+                        "runId": run_id,
+                        "sessionKey": sk,
+                        "state": "retrying",
+                        "error": error_obj,
+                        "retryAfterMs": delay_ms,
+                        "seq": seq,
+                    })
+                },
             };
             broadcast(&state, "chat", payload, BroadcastOpts::default()).await;
         }
+        latest_reasoning
     });
 
     // Convert persisted JSON history to typed ChatMessages for the LLM provider.
@@ -4275,21 +4498,34 @@ async fn run_with_tools(
     // Ensure all runner events (including deltas) are broadcast in order before
     // emitting terminal final/error frames.
     drop(on_event);
-    if let Err(e) = event_forwarder.await {
-        warn!(run_id, error = %e, "runner event forwarder task failed");
-    }
+    let reasoning_text = match event_forwarder.await {
+        Ok(reasoning) => reasoning,
+        Err(e) => {
+            warn!(run_id, error = %e, "runner event forwarder task failed");
+            String::new()
+        },
+    };
+    let reasoning = {
+        let trimmed = reasoning_text.trim();
+        (!trimmed.is_empty()).then(|| trimmed.to_string())
+    };
 
     match result {
         Ok(result) => {
             clear_unsupported_model(state, model_store, model_id).await;
 
-            let is_silent = result.text.trim().is_empty();
+            let iterations = result.iterations;
+            let tool_calls_made = result.tool_calls_made;
+            let usage = result.usage;
+            let llm_api_response = (!result.raw_llm_responses.is_empty())
+                .then_some(Value::Array(result.raw_llm_responses));
             let display_text = result.text;
+            let is_silent = display_text.trim().is_empty();
 
             info!(
                 run_id,
-                iterations = result.iterations,
-                tool_calls = result.tool_calls_made,
+                iterations,
+                tool_calls = tool_calls_made,
                 response = %display_text,
                 silent = is_silent,
                 "agent run complete"
@@ -4297,22 +4533,35 @@ async fn run_with_tools(
             let assistant_message_index = user_message_index + 1;
 
             // Generate & persist TTS audio for voice-medium web UI replies.
+            let mut audio_warning: Option<String> = None;
             let audio_path = if !is_silent && desired_reply_medium == ReplyMedium::Voice {
-                if let Some(bytes) = generate_tts_audio(state, session_key, &display_text).await {
-                    let filename = format!("{run_id}.ogg");
-                    if let Some(store) = session_store {
-                        match store.save_media(session_key, &filename, &bytes).await {
-                            Ok(path) => Some(path),
-                            Err(e) => {
-                                warn!(run_id, error = %e, "failed to save TTS audio to media dir");
-                                None
-                            },
+                match generate_tts_audio(state, session_key, &display_text).await {
+                    Ok(bytes) => {
+                        let filename = format!("{run_id}.ogg");
+                        if let Some(store) = session_store {
+                            match store.save_media(session_key, &filename, &bytes).await {
+                                Ok(path) => Some(path),
+                                Err(e) => {
+                                    let warning =
+                                        format!("TTS audio generated but failed to save: {e}");
+                                    warn!(run_id, error = %warning, "failed to save TTS audio to media dir");
+                                    audio_warning = Some(warning);
+                                    None
+                                },
+                            }
+                        } else {
+                            audio_warning = Some(
+                                "TTS audio generated but session media storage is unavailable"
+                                    .to_string(),
+                            );
+                            None
                         }
-                    } else {
+                    },
+                    Err(error) => {
+                        warn!(run_id, error = %error, "voice reply generation skipped");
+                        audio_warning = Some(error);
                         None
-                    }
-                } else {
-                    None
+                    },
                 }
             } else {
                 None
@@ -4325,13 +4574,15 @@ async fn run_with_tools(
                 text: display_text.clone(),
                 model: provider_ref.id().to_string(),
                 provider: provider_name.to_string(),
-                input_tokens: result.usage.input_tokens,
-                output_tokens: result.usage.output_tokens,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
                 message_index: assistant_message_index,
                 reply_medium: desired_reply_medium,
-                iterations: Some(result.iterations),
-                tool_calls_made: Some(result.tool_calls_made),
+                iterations: Some(iterations),
+                tool_calls_made: Some(tool_calls_made),
                 audio: audio_path.clone(),
+                audio_warning,
+                reasoning: reasoning.clone(),
                 seq: client_seq,
             };
             #[allow(clippy::unwrap_used)] // serializing known-valid struct
@@ -4348,12 +4599,14 @@ async fn run_with_tools(
                 deliver_channel_replies(state, session_key, &display_text, desired_reply_medium)
                     .await;
             }
-            Some((
-                display_text,
-                result.usage.input_tokens,
-                result.usage.output_tokens,
+            Some(AssistantTurnOutput {
+                text: display_text,
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
                 audio_path,
-            ))
+                reasoning,
+                llm_api_response,
+            })
         },
         Err(e) => {
             let error_str = e.to_string();
@@ -4361,6 +4614,7 @@ async fn run_with_tools(
             state.set_run_error(run_id, error_str.clone()).await;
             let error_obj = parse_chat_error(&error_str, Some(provider_name));
             mark_unsupported_model(state, model_store, model_id, provider_name, &error_obj).await;
+            deliver_channel_error(state, session_key, &error_obj).await;
             let error_payload = ChatErrorBroadcast {
                 run_id: run_id.to_string(),
                 session_key: session_key.to_string(),
@@ -4411,7 +4665,12 @@ async fn compact_session(
             // Tool events not expected in summarization stream.
             StreamEvent::ToolCallStart { .. }
             | StreamEvent::ToolCallArgumentsDelta { .. }
-            | StreamEvent::ToolCallComplete { .. } => {},
+            | StreamEvent::ToolCallComplete { .. }
+            // Provider raw payloads are debug metadata, not summary text.
+            | StreamEvent::ProviderRaw(_)
+            // Ignore provider reasoning blocks; summary body should only
+            // include final answer text.
+            | StreamEvent::ReasoningDelta(_) => {},
         }
     }
 
@@ -4427,6 +4686,8 @@ async fn compact_session(
         input_tokens: None,
         output_tokens: None,
         tool_calls: None,
+        reasoning: None,
+        llm_api_response: None,
         audio: None,
         seq: None,
         run_id: None,
@@ -4443,6 +4704,76 @@ async fn compact_session(
 
 // ── Streaming mode (no tools) ───────────────────────────────────────────────
 
+const STREAM_RETRYABLE_SERVER_PATTERNS: &[&str] = &[
+    "http 500",
+    "http 502",
+    "http 503",
+    "http 504",
+    "internal server error",
+    "service unavailable",
+    "gateway timeout",
+    "temporarily unavailable",
+    "overloaded",
+    "timeout",
+    "connection reset",
+];
+const STREAM_SERVER_RETRY_DELAY_MS: u64 = 2_000;
+const STREAM_SERVER_MAX_RETRIES: u8 = 1;
+const STREAM_RATE_LIMIT_INITIAL_RETRY_MS: u64 = 2_000;
+const STREAM_RATE_LIMIT_MAX_RETRY_MS: u64 = 60_000;
+const STREAM_RATE_LIMIT_MAX_RETRIES: u8 = 10;
+
+fn is_retryable_stream_server_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    STREAM_RETRYABLE_SERVER_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+}
+
+fn next_stream_rate_limit_retry_ms(previous_ms: Option<u64>) -> u64 {
+    previous_ms
+        .map(|ms| ms.saturating_mul(2))
+        .unwrap_or(STREAM_RATE_LIMIT_INITIAL_RETRY_MS)
+        .clamp(
+            STREAM_RATE_LIMIT_INITIAL_RETRY_MS,
+            STREAM_RATE_LIMIT_MAX_RETRY_MS,
+        )
+}
+
+fn next_stream_retry_delay_ms(
+    raw_error: &str,
+    error_obj: &Value,
+    server_retries_remaining: &mut u8,
+    rate_limit_retries_remaining: &mut u8,
+    rate_limit_backoff_ms: &mut Option<u64>,
+) -> Option<u64> {
+    if error_obj.get("type").and_then(Value::as_str) == Some("rate_limit_exceeded") {
+        if *rate_limit_retries_remaining == 0 {
+            return None;
+        }
+        *rate_limit_retries_remaining -= 1;
+
+        let current_backoff = *rate_limit_backoff_ms;
+        *rate_limit_backoff_ms = Some(next_stream_rate_limit_retry_ms(current_backoff));
+
+        let hinted_ms = error_obj.get("retryAfterMs").and_then(Value::as_u64);
+        let delay_ms = hinted_ms
+            .or(*rate_limit_backoff_ms)
+            .unwrap_or(STREAM_RATE_LIMIT_INITIAL_RETRY_MS);
+        return Some(delay_ms.clamp(1, STREAM_RATE_LIMIT_MAX_RETRY_MS));
+    }
+
+    if is_retryable_stream_server_error(raw_error) {
+        if *server_retries_remaining == 0 {
+            return None;
+        }
+        *server_retries_remaining -= 1;
+        return Some(STREAM_SERVER_RETRY_DELAY_MS);
+    }
+
+    None
+}
+
 async fn run_streaming(
     state: &Arc<GatewayState>,
     model_store: &Arc<RwLock<DisabledModelsStore>>,
@@ -4451,7 +4782,7 @@ async fn run_streaming(
     model_id: &str,
     user_content: &UserContent,
     provider_name: &str,
-    history_raw: &[serde_json::Value],
+    history_raw: &[Value],
     session_key: &str,
     desired_reply_medium: ReplyMedium,
     project_context: Option<&str>,
@@ -4460,7 +4791,7 @@ async fn run_streaming(
     runtime_context: Option<&PromptRuntimeContext>,
     session_store: Option<&Arc<SessionStore>>,
     client_seq: Option<u64>,
-) -> Option<(String, u32, u32, Option<String>)> {
+) -> Option<AssistantTurnOutput> {
     let persona = load_prompt_persona();
 
     let system_prompt = build_system_prompt_minimal_runtime(
@@ -4471,6 +4802,7 @@ async fn run_streaming(
         persona.agents_text.as_deref(),
         persona.tools_text.as_deref(),
         runtime_context,
+        persona.memory_text.as_deref(),
     );
 
     // Layer 1: instruct the LLM to write speech-friendly output when voice is active.
@@ -4488,171 +4820,279 @@ async fn run_streaming(
         content: user_content.clone(),
     });
 
-    #[cfg(feature = "metrics")]
-    let stream_start = Instant::now();
+    let mut server_retries_remaining: u8 = STREAM_SERVER_MAX_RETRIES;
+    let mut rate_limit_retries_remaining: u8 = STREAM_RATE_LIMIT_MAX_RETRIES;
+    let mut rate_limit_backoff_ms: Option<u64> = None;
 
-    let mut stream = provider.stream(messages);
-    let mut accumulated = String::new();
+    'attempts: loop {
+        #[cfg(feature = "metrics")]
+        let stream_start = Instant::now();
 
-    while let Some(event) = stream.next().await {
-        match event {
-            StreamEvent::Delta(delta) => {
-                accumulated.push_str(&delta);
-                broadcast(
-                    state,
-                    "chat",
-                    serde_json::json!({
-                        "runId": run_id,
-                        "sessionKey": session_key,
-                        "state": "delta",
-                        "text": delta,
-                    }),
-                    BroadcastOpts::default(),
-                )
-                .await;
-            },
-            StreamEvent::Done(usage) => {
-                clear_unsupported_model(state, model_store, model_id).await;
+        let mut stream = provider.stream(messages.clone());
+        let mut accumulated = String::new();
+        let mut accumulated_reasoning = String::new();
+        let mut raw_llm_responses: Vec<Value> = Vec::new();
 
-                // Record streaming completion metrics (mirroring provider_chain.rs)
-                #[cfg(feature = "metrics")]
-                {
-                    let duration = stream_start.elapsed().as_secs_f64();
-                    counter!(
-                        llm_metrics::COMPLETIONS_TOTAL,
-                        labels::PROVIDER => provider_name.to_string(),
-                        labels::MODEL => model_id.to_string()
+        while let Some(event) = stream.next().await {
+            match event {
+                StreamEvent::Delta(delta) => {
+                    accumulated.push_str(&delta);
+                    broadcast(
+                        state,
+                        "chat",
+                        serde_json::json!({
+                            "runId": run_id,
+                            "sessionKey": session_key,
+                            "state": "delta",
+                            "text": delta,
+                        }),
+                        BroadcastOpts::default(),
                     )
-                    .increment(1);
-                    counter!(
-                        llm_metrics::INPUT_TOKENS_TOTAL,
-                        labels::PROVIDER => provider_name.to_string(),
-                        labels::MODEL => model_id.to_string()
+                    .await;
+                },
+                StreamEvent::ReasoningDelta(delta) => {
+                    accumulated_reasoning.push_str(&delta);
+                    broadcast(
+                        state,
+                        "chat",
+                        serde_json::json!({
+                            "runId": run_id,
+                            "sessionKey": session_key,
+                            "state": "thinking_text",
+                            "text": accumulated_reasoning.clone(),
+                        }),
+                        BroadcastOpts::default(),
                     )
-                    .increment(u64::from(usage.input_tokens));
-                    counter!(
-                        llm_metrics::OUTPUT_TOKENS_TOTAL,
-                        labels::PROVIDER => provider_name.to_string(),
-                        labels::MODEL => model_id.to_string()
-                    )
-                    .increment(u64::from(usage.output_tokens));
-                    counter!(
-                        llm_metrics::CACHE_READ_TOKENS_TOTAL,
-                        labels::PROVIDER => provider_name.to_string(),
-                        labels::MODEL => model_id.to_string()
-                    )
-                    .increment(u64::from(usage.cache_read_tokens));
-                    counter!(
-                        llm_metrics::CACHE_WRITE_TOKENS_TOTAL,
-                        labels::PROVIDER => provider_name.to_string(),
-                        labels::MODEL => model_id.to_string()
-                    )
-                    .increment(u64::from(usage.cache_write_tokens));
-                    histogram!(
-                        llm_metrics::COMPLETION_DURATION_SECONDS,
-                        labels::PROVIDER => provider_name.to_string(),
-                        labels::MODEL => model_id.to_string()
-                    )
-                    .record(duration);
-                }
+                    .await;
+                },
+                StreamEvent::ProviderRaw(raw) => {
+                    if raw_llm_responses.len() < 256 {
+                        raw_llm_responses.push(raw);
+                    }
+                },
+                StreamEvent::Done(usage) => {
+                    clear_unsupported_model(state, model_store, model_id).await;
 
-                let is_silent = accumulated.trim().is_empty();
-
-                info!(
-                    run_id,
-                    input_tokens = usage.input_tokens,
-                    output_tokens = usage.output_tokens,
-                    response = %accumulated,
-                    silent = is_silent,
-                    "chat stream done"
-                );
-                let assistant_message_index = user_message_index + 1;
-
-                // Generate & persist TTS audio for voice-medium web UI replies.
-                let audio_path = if !is_silent && desired_reply_medium == ReplyMedium::Voice {
-                    if let Some(bytes) = generate_tts_audio(state, session_key, &accumulated).await
+                    // Record streaming completion metrics (mirroring provider_chain.rs)
+                    #[cfg(feature = "metrics")]
                     {
-                        let filename = format!("{run_id}.ogg");
-                        if let Some(store) = session_store {
-                            match store.save_media(session_key, &filename, &bytes).await {
-                                Ok(path) => Some(path),
-                                Err(e) => {
-                                    warn!(run_id, error = %e, "failed to save TTS audio to media dir");
+                        let duration = stream_start.elapsed().as_secs_f64();
+                        counter!(
+                            llm_metrics::COMPLETIONS_TOTAL,
+                            labels::PROVIDER => provider_name.to_string(),
+                            labels::MODEL => model_id.to_string()
+                        )
+                        .increment(1);
+                        counter!(
+                            llm_metrics::INPUT_TOKENS_TOTAL,
+                            labels::PROVIDER => provider_name.to_string(),
+                            labels::MODEL => model_id.to_string()
+                        )
+                        .increment(u64::from(usage.input_tokens));
+                        counter!(
+                            llm_metrics::OUTPUT_TOKENS_TOTAL,
+                            labels::PROVIDER => provider_name.to_string(),
+                            labels::MODEL => model_id.to_string()
+                        )
+                        .increment(u64::from(usage.output_tokens));
+                        counter!(
+                            llm_metrics::CACHE_READ_TOKENS_TOTAL,
+                            labels::PROVIDER => provider_name.to_string(),
+                            labels::MODEL => model_id.to_string()
+                        )
+                        .increment(u64::from(usage.cache_read_tokens));
+                        counter!(
+                            llm_metrics::CACHE_WRITE_TOKENS_TOTAL,
+                            labels::PROVIDER => provider_name.to_string(),
+                            labels::MODEL => model_id.to_string()
+                        )
+                        .increment(u64::from(usage.cache_write_tokens));
+                        histogram!(
+                            llm_metrics::COMPLETION_DURATION_SECONDS,
+                            labels::PROVIDER => provider_name.to_string(),
+                            labels::MODEL => model_id.to_string()
+                        )
+                        .record(duration);
+                    }
+
+                    let is_silent = accumulated.trim().is_empty();
+                    let reasoning = {
+                        let trimmed = accumulated_reasoning.trim();
+                        (!trimmed.is_empty()).then(|| trimmed.to_string())
+                    };
+
+                    info!(
+                        run_id,
+                        input_tokens = usage.input_tokens,
+                        output_tokens = usage.output_tokens,
+                        response = %accumulated,
+                        silent = is_silent,
+                        "chat stream done"
+                    );
+                    let assistant_message_index = user_message_index + 1;
+
+                    // Generate & persist TTS audio for voice-medium web UI replies.
+                    let mut audio_warning: Option<String> = None;
+                    let audio_path = if !is_silent && desired_reply_medium == ReplyMedium::Voice {
+                        match generate_tts_audio(state, session_key, &accumulated).await {
+                            Ok(bytes) => {
+                                let filename = format!("{run_id}.ogg");
+                                if let Some(store) = session_store {
+                                    match store.save_media(session_key, &filename, &bytes).await {
+                                        Ok(path) => Some(path),
+                                        Err(e) => {
+                                            let warning = format!(
+                                                "TTS audio generated but failed to save: {e}"
+                                            );
+                                            warn!(run_id, error = %warning, "failed to save TTS audio to media dir");
+                                            audio_warning = Some(warning);
+                                            None
+                                        },
+                                    }
+                                } else {
+                                    audio_warning = Some(
+                                        "TTS audio generated but session media storage is unavailable"
+                                            .to_string(),
+                                    );
                                     None
-                                },
-                            }
-                        } else {
-                            None
+                                }
+                            },
+                            Err(error) => {
+                                warn!(run_id, error = %error, "voice reply generation skipped");
+                                audio_warning = Some(error);
+                                None
+                            },
                         }
                     } else {
                         None
-                    }
-                } else {
-                    None
-                };
+                    };
 
-                let final_payload = ChatFinalBroadcast {
-                    run_id: run_id.to_string(),
-                    session_key: session_key.to_string(),
-                    state: "final",
-                    text: accumulated.clone(),
-                    model: provider.id().to_string(),
-                    provider: provider_name.to_string(),
-                    input_tokens: usage.input_tokens,
-                    output_tokens: usage.output_tokens,
-                    message_index: assistant_message_index,
-                    reply_medium: desired_reply_medium,
-                    iterations: None,
-                    tool_calls_made: None,
-                    audio: audio_path.clone(),
-                    seq: client_seq,
-                };
-                #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let payload_val = serde_json::to_value(&final_payload).unwrap();
-                broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
+                    let final_payload = ChatFinalBroadcast {
+                        run_id: run_id.to_string(),
+                        session_key: session_key.to_string(),
+                        state: "final",
+                        text: accumulated.clone(),
+                        model: provider.id().to_string(),
+                        provider: provider_name.to_string(),
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        message_index: assistant_message_index,
+                        reply_medium: desired_reply_medium,
+                        iterations: None,
+                        tool_calls_made: None,
+                        audio: audio_path.clone(),
+                        audio_warning,
+                        reasoning: reasoning.clone(),
+                        seq: client_seq,
+                    };
+                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
+                    let payload_val = serde_json::to_value(&final_payload).unwrap();
+                    broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
 
-                if !is_silent {
-                    // Send push notification when chat response completes
-                    #[cfg(feature = "push-notifications")]
-                    {
-                        tracing::info!("push: checking push notification");
-                        send_chat_push_notification(state, session_key, &accumulated).await;
-                    }
-                    deliver_channel_replies(state, session_key, &accumulated, desired_reply_medium)
+                    if !is_silent {
+                        // Send push notification when chat response completes
+                        #[cfg(feature = "push-notifications")]
+                        {
+                            tracing::info!("push: checking push notification");
+                            send_chat_push_notification(state, session_key, &accumulated).await;
+                        }
+                        deliver_channel_replies(
+                            state,
+                            session_key,
+                            &accumulated,
+                            desired_reply_medium,
+                        )
                         .await;
-                }
-                return Some((
-                    accumulated,
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    audio_path,
-                ));
-            },
-            StreamEvent::Error(msg) => {
-                warn!(run_id, error = %msg, "chat stream error");
-                state.set_run_error(run_id, msg.clone()).await;
-                let error_obj = parse_chat_error(&msg, Some(provider_name));
-                mark_unsupported_model(state, model_store, model_id, provider_name, &error_obj)
-                    .await;
-                let error_payload = ChatErrorBroadcast {
-                    run_id: run_id.to_string(),
-                    session_key: session_key.to_string(),
-                    state: "error",
-                    error: error_obj,
-                    seq: client_seq,
-                };
-                #[allow(clippy::unwrap_used)] // serializing known-valid struct
-                let payload_val = serde_json::to_value(&error_payload).unwrap();
-                broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
-                return None;
-            },
-            // Tool events not expected in stream-only mode.
-            StreamEvent::ToolCallStart { .. }
-            | StreamEvent::ToolCallArgumentsDelta { .. }
-            | StreamEvent::ToolCallComplete { .. } => {},
+                    }
+                    let llm_api_response =
+                        (!raw_llm_responses.is_empty()).then_some(Value::Array(raw_llm_responses));
+                    return Some(AssistantTurnOutput {
+                        text: accumulated,
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        audio_path,
+                        reasoning,
+                        llm_api_response,
+                    });
+                },
+                StreamEvent::Error(msg) => {
+                    let error_obj = parse_chat_error(&msg, Some(provider_name));
+                    let has_no_streamed_content = accumulated.trim().is_empty()
+                        && accumulated_reasoning.trim().is_empty()
+                        && raw_llm_responses.is_empty();
+                    if has_no_streamed_content
+                        && let Some(delay_ms) = next_stream_retry_delay_ms(
+                            &msg,
+                            &error_obj,
+                            &mut server_retries_remaining,
+                            &mut rate_limit_retries_remaining,
+                            &mut rate_limit_backoff_ms,
+                        )
+                    {
+                        warn!(
+                            run_id,
+                            error = %msg,
+                            delay_ms,
+                            server_retries_remaining,
+                            rate_limit_retries_remaining,
+                            "chat stream transient error, retrying after delay"
+                        );
+                        if error_obj.get("type").and_then(Value::as_str)
+                            == Some("rate_limit_exceeded")
+                        {
+                            send_retry_status_to_channels(
+                                state,
+                                session_key,
+                                &error_obj,
+                                Duration::from_millis(delay_ms),
+                            )
+                            .await;
+                        }
+                        broadcast(
+                            state,
+                            "chat",
+                            serde_json::json!({
+                                "runId": run_id,
+                                "sessionKey": session_key,
+                                "state": "retrying",
+                                "error": error_obj,
+                                "retryAfterMs": delay_ms,
+                                "seq": client_seq,
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue 'attempts;
+                    }
+
+                    warn!(run_id, error = %msg, "chat stream error");
+                    state.set_run_error(run_id, msg.clone()).await;
+                    mark_unsupported_model(state, model_store, model_id, provider_name, &error_obj)
+                        .await;
+                    deliver_channel_error(state, session_key, &error_obj).await;
+                    let error_payload = ChatErrorBroadcast {
+                        run_id: run_id.to_string(),
+                        session_key: session_key.to_string(),
+                        state: "error",
+                        error: error_obj,
+                        seq: client_seq,
+                    };
+                    #[allow(clippy::unwrap_used)] // serializing known-valid struct
+                    let payload_val = serde_json::to_value(&error_payload).unwrap();
+                    broadcast(state, "chat", payload_val, BroadcastOpts::default()).await;
+                    return None;
+                },
+                // Tool events not expected in stream-only mode.
+                StreamEvent::ToolCallStart { .. }
+                | StreamEvent::ToolCallArgumentsDelta { .. }
+                | StreamEvent::ToolCallComplete { .. } => {},
+            }
         }
+
+        // Stream ended unexpectedly without Done/Error.
+        return None;
     }
-    None
 }
 
 /// Send a push notification when a chat response completes.
@@ -4681,7 +5121,7 @@ async fn send_chat_push_notification(state: &Arc<GatewayState>, session_key: &st
 
     // Create a short summary of the response (first 100 chars)
     let summary = if text.len() > 100 {
-        format!("{}…", &text[..100])
+        format!("{}…", truncate_at_char_boundary(text, 100))
     } else {
         text.to_string()
     };
@@ -4808,6 +5248,149 @@ fn format_logbook_text(entries: &[String]) -> String {
         text.push('\n');
     }
     text
+}
+
+fn format_channel_retry_message(error_obj: &Value, retry_after: Duration) -> String {
+    let retry_secs = ((retry_after.as_millis() as u64).saturating_add(999) / 1_000).max(1);
+    if error_obj.get("type").and_then(|v| v.as_str()) == Some("rate_limit_exceeded") {
+        format!("⏳ Provider rate limited. Retrying in {retry_secs}s.")
+    } else {
+        format!("⏳ Temporary provider issue. Retrying in {retry_secs}s.")
+    }
+}
+
+fn format_channel_error_message(error_obj: &Value) -> String {
+    let title = error_obj
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Request failed");
+    let detail = error_obj
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Please try again.");
+    format!("⚠️ {title}: {detail}")
+}
+
+/// Send a short retry status update to pending channel targets without draining
+/// them. The final reply (or terminal error) will still use the same targets.
+async fn send_retry_status_to_channels(
+    state: &Arc<GatewayState>,
+    session_key: &str,
+    error_obj: &Value,
+    retry_after: Duration,
+) {
+    let targets = state.peek_channel_replies(session_key).await;
+    if targets.is_empty() {
+        return;
+    }
+
+    let outbound = match state.services.channel_outbound_arc() {
+        Some(o) => o,
+        None => return,
+    };
+
+    let message = format_channel_retry_message(error_obj, retry_after);
+    let mut tasks = Vec::with_capacity(targets.len());
+    for target in targets {
+        let outbound = Arc::clone(&outbound);
+        let message = message.clone();
+        tasks.push(tokio::spawn(async move {
+            let reply_to = target.message_id.as_deref();
+            if let Err(e) = outbound
+                .send_text_silent(&target.account_id, &target.chat_id, &message, reply_to)
+                .await
+            {
+                warn!(
+                    account_id = target.account_id,
+                    chat_id = target.chat_id,
+                    "failed to send retry status to channel: {e}"
+                );
+            }
+        }));
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            warn!(error = %e, "channel retry status task join failed");
+        }
+    }
+}
+
+/// Drain pending channel targets for a session and send a terminal error message.
+async fn deliver_channel_error(state: &Arc<GatewayState>, session_key: &str, error_obj: &Value) {
+    let targets = state.drain_channel_replies(session_key).await;
+    let status_log = state.drain_channel_status_log(session_key).await;
+    if targets.is_empty() {
+        return;
+    }
+
+    let outbound = match state.services.channel_outbound_arc() {
+        Some(o) => o,
+        None => return,
+    };
+
+    let error_text = format_channel_error_message(error_obj);
+    let logbook_html = format_logbook_html(&status_log);
+    let logbook_text = format_logbook_text(&status_log);
+    let mut tasks = Vec::with_capacity(targets.len());
+    for target in targets {
+        let outbound = Arc::clone(&outbound);
+        let error_text = error_text.clone();
+        let logbook_html = logbook_html.clone();
+        let logbook_text = logbook_text.clone();
+        tasks.push(tokio::spawn(async move {
+            let reply_to = target.message_id.as_deref();
+            let send_result = match target.channel_type {
+                moltis_channels::ChannelType::Telegram => {
+                    if logbook_html.is_empty() {
+                        outbound
+                            .send_text(&target.account_id, &target.chat_id, &error_text, reply_to)
+                            .await
+                    } else {
+                        outbound
+                            .send_text_with_suffix(
+                                &target.account_id,
+                                &target.chat_id,
+                                &error_text,
+                                &logbook_html,
+                                reply_to,
+                            )
+                            .await
+                    }
+                },
+                moltis_channels::ChannelType::Slack => {
+                    let primary_result = outbound
+                        .send_text(&target.account_id, &target.chat_id, &error_text, reply_to)
+                        .await;
+                    if primary_result.is_err() || logbook_text.is_empty() {
+                        primary_result
+                    } else {
+                        outbound
+                            .send_text(
+                                &target.account_id,
+                                &target.chat_id,
+                                &logbook_text,
+                                None,
+                            )
+                            .await
+                    }
+                },
+            };
+            if let Err(e) = send_result {
+                warn!(
+                    account_id = target.account_id,
+                    chat_id = target.chat_id,
+                    "failed to send channel error reply: {e}"
+                );
+            }
+        }));
+    }
+
+    for task in tasks {
+        if let Err(e) = task.await {
+            warn!(error = %e, "channel error task join failed");
+        }
+    }
 }
 
 async fn deliver_channel_replies_to_targets(
@@ -5060,17 +5643,27 @@ async fn generate_tts_audio(
     state: &Arc<GatewayState>,
     session_key: &str,
     text: &str,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, String> {
     use base64::Engine;
 
-    let tts_status = state.services.tts.status().await.ok()?;
-    let status: TtsStatusResponse = serde_json::from_value(tts_status).ok()?;
+    let tts_status = state
+        .services
+        .tts
+        .status()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status: TtsStatusResponse =
+        serde_json::from_value(tts_status).map_err(|_| "invalid tts.status response")?;
     if !status.enabled {
-        return None;
+        return Err("TTS is disabled or not configured".to_string());
     }
 
     // Layer 2: strip markdown/URLs the LLM may have included despite the prompt.
     let text = moltis_voice::tts::sanitize_text_for_tts(text);
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("response has no speakable text".to_string());
+    }
 
     let session_override = {
         state
@@ -5083,24 +5676,27 @@ async fn generate_tts_audio(
     };
 
     let request = TtsConvertRequest {
-        text: &text,
+        text,
         format: "ogg",
         provider: session_override.as_ref().and_then(|o| o.provider.clone()),
         voice_id: session_override.as_ref().and_then(|o| o.voice_id.clone()),
         model: session_override.as_ref().and_then(|o| o.model.clone()),
     };
 
+    let request_value = serde_json::to_value(request)
+        .map_err(|_| "failed to build tts.convert request".to_string())?;
     let tts_result = state
         .services
         .tts
-        .convert(serde_json::to_value(request).ok()?)
+        .convert(request_value)
         .await
-        .ok()?;
+        .map_err(|e| e.to_string())?;
 
-    let response: TtsConvertResponse = serde_json::from_value(tts_result).ok()?;
+    let response: TtsConvertResponse =
+        serde_json::from_value(tts_result).map_err(|_| "invalid tts.convert response")?;
     base64::engine::general_purpose::STANDARD
         .decode(&response.audio)
-        .ok()
+        .map_err(|_| "invalid base64 audio returned by TTS provider".to_string())
 }
 
 async fn build_tts_payload(
@@ -5170,7 +5766,7 @@ async fn send_tool_status_to_channels(
     state: &Arc<GatewayState>,
     session_key: &str,
     tool_name: &str,
-    arguments: &serde_json::Value,
+    arguments: &Value,
 ) {
     let targets = state.peek_channel_replies(session_key).await;
     if targets.is_empty() {
@@ -5183,7 +5779,7 @@ async fn send_tool_status_to_channels(
 }
 
 /// Format a human-readable tool execution message.
-fn format_tool_status_message(tool_name: &str, arguments: &serde_json::Value) -> String {
+fn format_tool_status_message(tool_name: &str, arguments: &Value) -> String {
     match tool_name {
         "browser" => {
             let action = arguments
@@ -5223,7 +5819,7 @@ fn format_tool_status_message(tool_name: &str, arguments: &serde_json::Value) ->
             if let Some(cmd) = command {
                 // Show first ~50 chars of command
                 let display_cmd = if cmd.len() > 50 {
-                    format!("{}...", &cmd[..50])
+                    format!("{}...", truncate_at_char_boundary(cmd, 50))
                 } else {
                     cmd.to_string()
                 };
@@ -5244,7 +5840,7 @@ fn format_tool_status_message(tool_name: &str, arguments: &serde_json::Value) ->
             let query = arguments.get("query").and_then(|v| v.as_str());
             if let Some(q) = query {
                 let display_q = if q.len() > 40 {
-                    format!("{}...", &q[..40])
+                    format!("{}...", truncate_at_char_boundary(q, 40))
                 } else {
                     q.to_string()
                 };
@@ -5269,7 +5865,7 @@ fn truncate_url(url: &str) -> String {
 
     // Take first 50 chars max
     if without_scheme.len() > 50 {
-        format!("{}...", &without_scheme[..50])
+        format!("{}...", truncate_at_char_boundary(without_scheme, 50))
     } else {
         without_scheme.to_string()
     }
@@ -5469,8 +6065,8 @@ mod tests {
         async fn complete(
             &self,
             _messages: &[ChatMessage],
-            _tools: &[serde_json::Value],
-        ) -> anyhow::Result<moltis_agents::model::CompletionResponse> {
+            _tools: &[Value],
+        ) -> Result<moltis_agents::model::CompletionResponse> {
             anyhow::bail!("not implemented for test")
         }
 
@@ -5492,11 +6088,11 @@ mod tests {
             "test"
         }
 
-        fn parameters_schema(&self) -> serde_json::Value {
+        fn parameters_schema(&self) -> Value {
             serde_json::json!({})
         }
 
-        async fn execute(&self, _params: serde_json::Value) -> Result<serde_json::Value> {
+        async fn execute(&self, _params: Value) -> Result<Value> {
             Ok(serde_json::json!({}))
         }
     }
@@ -5504,6 +6100,14 @@ mod tests {
     struct MockChannelOutbound {
         calls: Arc<AtomicUsize>,
         delay: Duration,
+    }
+
+    #[test]
+    fn truncate_at_char_boundary_handles_multibyte_boundary() {
+        let text = format!("{}л{}", "a".repeat(99), "z");
+        let truncated = truncate_at_char_boundary(&text, 100);
+        assert_eq!(truncated.len(), 99);
+        assert!(truncated.chars().all(|c| c == 'a'));
     }
 
     #[test]
@@ -5570,7 +6174,7 @@ mod tests {
             chat_id: "123".to_string(),
             message_id: None,
         }];
-        let state = crate::state::GatewayState::new(
+        let state = GatewayState::new(
             crate::auth::ResolvedAuth {
                 mode: crate::auth::AuthMode::Token,
                 token: None,
@@ -5596,6 +6200,77 @@ mod tests {
             "delivery should wait for outbound send completion"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn format_channel_retry_message_rounds_up_seconds() {
+        let error_obj = serde_json::json!({ "type": "rate_limit_exceeded" });
+        let msg = format_channel_retry_message(&error_obj, Duration::from_millis(1_200));
+        assert!(msg.contains("Retrying in 2s"));
+    }
+
+    #[test]
+    fn format_channel_error_message_prefers_structured_fields() {
+        let error_obj = serde_json::json!({
+            "title": "Rate limited",
+            "detail": "Please wait and try again.",
+        });
+        let msg = format_channel_error_message(&error_obj);
+        assert_eq!(msg, "⚠️ Rate limited: Please wait and try again.");
+    }
+
+    #[test]
+    fn next_stream_retry_delay_uses_retry_after_for_rate_limits() {
+        let mut server_retries_remaining = STREAM_SERVER_MAX_RETRIES;
+        let mut rate_limit_retries_remaining = STREAM_RATE_LIMIT_MAX_RETRIES;
+        let mut rate_limit_backoff_ms = None;
+        let error_obj = serde_json::json!({
+            "type": "rate_limit_exceeded",
+            "retryAfterMs": 3500
+        });
+
+        let delay = next_stream_retry_delay_ms(
+            "HTTP 429 Too Many Requests",
+            &error_obj,
+            &mut server_retries_remaining,
+            &mut rate_limit_retries_remaining,
+            &mut rate_limit_backoff_ms,
+        );
+
+        assert_eq!(delay, Some(3500));
+        assert_eq!(
+            rate_limit_retries_remaining,
+            STREAM_RATE_LIMIT_MAX_RETRIES - 1
+        );
+        assert_eq!(
+            rate_limit_backoff_ms,
+            Some(STREAM_RATE_LIMIT_INITIAL_RETRY_MS)
+        );
+    }
+
+    #[test]
+    fn next_stream_retry_delay_retries_transient_server_errors_once() {
+        let mut server_retries_remaining = STREAM_SERVER_MAX_RETRIES;
+        let mut rate_limit_retries_remaining = STREAM_RATE_LIMIT_MAX_RETRIES;
+        let mut rate_limit_backoff_ms = None;
+
+        let first = next_stream_retry_delay_ms(
+            "HTTP 503 Service Unavailable",
+            &serde_json::json!({"type":"api_error"}),
+            &mut server_retries_remaining,
+            &mut rate_limit_retries_remaining,
+            &mut rate_limit_backoff_ms,
+        );
+        let second = next_stream_retry_delay_ms(
+            "HTTP 503 Service Unavailable",
+            &serde_json::json!({"type":"api_error"}),
+            &mut server_retries_remaining,
+            &mut rate_limit_retries_remaining,
+            &mut rate_limit_backoff_ms,
+        );
+
+        assert_eq!(first, Some(STREAM_SERVER_RETRY_DELAY_MS));
+        assert_eq!(second, None);
     }
 
     #[tokio::test]
@@ -5644,6 +6319,16 @@ mod tests {
         Arc::clone(
             map.entry(key.to_string())
                 .or_insert_with(|| Arc::new(Semaphore::new(1))),
+        )
+    }
+
+    fn make_active_run_maps() -> (
+        Arc<RwLock<HashMap<String, AbortHandle>>>,
+        Arc<RwLock<HashMap<String, String>>>,
+    ) {
+        (
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(RwLock::new(HashMap::new())),
         )
     }
 
@@ -5718,6 +6403,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn abort_run_handle_resolves_run_from_session_key() {
+        let (active_runs, active_runs_by_session) = make_active_run_maps();
+
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+
+        active_runs
+            .write()
+            .await
+            .insert("run-a".to_string(), task.abort_handle());
+        active_runs_by_session
+            .write()
+            .await
+            .insert("main".to_string(), "run-a".to_string());
+
+        let (resolved_run_id, aborted) = LiveChatService::abort_run_handle(
+            &active_runs,
+            &active_runs_by_session,
+            None,
+            Some("main"),
+        )
+        .await;
+        assert_eq!(resolved_run_id.as_deref(), Some("run-a"));
+        assert!(aborted);
+        assert!(active_runs.read().await.is_empty());
+        assert!(active_runs_by_session.read().await.is_empty());
+
+        let err = task.await.expect_err("task should be cancelled");
+        assert!(err.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn abort_run_handle_by_run_id_clears_session_lookup() {
+        let (active_runs, active_runs_by_session) = make_active_run_maps();
+
+        let task = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+
+        active_runs
+            .write()
+            .await
+            .insert("run-b".to_string(), task.abort_handle());
+        active_runs_by_session
+            .write()
+            .await
+            .insert("main".to_string(), "run-b".to_string());
+
+        let (resolved_run_id, aborted) = LiveChatService::abort_run_handle(
+            &active_runs,
+            &active_runs_by_session,
+            Some("run-b"),
+            None,
+        )
+        .await;
+        assert_eq!(resolved_run_id.as_deref(), Some("run-b"));
+        assert!(aborted);
+        assert!(active_runs.read().await.is_empty());
+        assert!(active_runs_by_session.read().await.is_empty());
+
+        let err = task.await.expect_err("task should be cancelled");
+        assert!(err.is_cancelled());
+    }
+
+    #[tokio::test]
     async fn agent_timeout_cancels_slow_future() {
         use std::time::Duration;
 
@@ -5760,6 +6511,15 @@ mod tests {
 
     fn make_message_queue() -> Arc<RwLock<HashMap<String, Vec<QueuedMessage>>>> {
         Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn make_target(message_id: &str) -> Value {
+        serde_json::json!({
+            "channel_type": "telegram",
+            "account_id": "bot1",
+            "chat_id": "123",
+            "message_id": message_id,
+        })
     }
 
     #[tokio::test]
@@ -5904,6 +6664,97 @@ mod tests {
         assert_eq!(entries[1].params["text"], "c");
     }
 
+    #[tokio::test]
+    async fn followup_drain_preserves_per_message_channel_targets() {
+        let queue = make_message_queue();
+        let key = "sess_channel_targets";
+
+        {
+            let mut q = queue.write().await;
+            let entry = q.entry(key.to_string()).or_default();
+            entry.push(QueuedMessage {
+                params: serde_json::json!({
+                    "text": "a",
+                    "_channel_reply_target": make_target("m1"),
+                }),
+            });
+            entry.push(QueuedMessage {
+                params: serde_json::json!({
+                    "text": "b",
+                    "_channel_reply_target": make_target("m2"),
+                }),
+            });
+            entry.push(QueuedMessage {
+                params: serde_json::json!({
+                    "text": "c",
+                    "_channel_reply_target": make_target("m3"),
+                }),
+            });
+        }
+
+        let queued = queue.write().await.remove(key).unwrap_or_default();
+        let mut iter = queued.into_iter();
+        let first = iter.next().expect("queued is non-empty");
+        let rest: Vec<QueuedMessage> = iter.collect();
+
+        assert_eq!(first.params["_channel_reply_target"]["message_id"], "m1");
+
+        if !rest.is_empty() {
+            queue
+                .write()
+                .await
+                .entry(key.to_string())
+                .or_default()
+                .extend(rest);
+        }
+
+        let remaining = queue.read().await;
+        let entries = remaining.get(key).expect("requeued messages");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries[0].params["_channel_reply_target"]["message_id"],
+            "m2"
+        );
+        assert_eq!(
+            entries[1].params["_channel_reply_target"]["message_id"],
+            "m3"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_drain_uses_last_message_channel_target() {
+        let queued = [
+            QueuedMessage {
+                params: serde_json::json!({
+                    "text": "first",
+                    "_channel_reply_target": make_target("m1"),
+                }),
+            },
+            QueuedMessage {
+                params: serde_json::json!({
+                    "text": "second",
+                    "_channel_reply_target": make_target("m2"),
+                }),
+            },
+            QueuedMessage {
+                params: serde_json::json!({
+                    "text": "third",
+                    "_channel_reply_target": make_target("m3"),
+                }),
+            },
+        ];
+
+        let combined: Vec<&str> = queued
+            .iter()
+            .filter_map(|m| m.params.get("text").and_then(|v| v.as_str()))
+            .collect();
+        let mut merged = queued.last().expect("non-empty queue").params.clone();
+        merged["text"] = serde_json::json!(combined.join("\n\n"));
+
+        assert_eq!(merged["text"], "first\n\nsecond\n\nthird");
+        assert_eq!(merged["_channel_reply_target"]["message_id"], "m3");
+    }
+
     #[test]
     fn message_queue_mode_default_is_followup() {
         let mode = MessageQueueMode::default();
@@ -6029,7 +6880,7 @@ mod tests {
             homepage: None,
             dockerfile: None,
             requires: Default::default(),
-            path: std::path::PathBuf::new(),
+            path: PathBuf::new(),
             source: None,
         }];
 
@@ -6062,7 +6913,7 @@ mod tests {
             homepage: None,
             dockerfile: None,
             requires: Default::default(),
-            path: std::path::PathBuf::new(),
+            path: PathBuf::new(),
             source: None,
         }];
 
@@ -6909,5 +7760,41 @@ mod tests {
             });
 
         assert!(extracted.is_none());
+    }
+
+    // ── active_session_keys tests ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn active_session_keys_empty_when_no_runs() {
+        let (_active_runs, active_runs_by_session) = make_active_run_maps();
+        let keys: Vec<String> = active_runs_by_session
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        assert!(keys.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_session_keys_returns_running_sessions() {
+        let (_active_runs, active_runs_by_session) = make_active_run_maps();
+        active_runs_by_session
+            .write()
+            .await
+            .insert("session-a".to_string(), "run-1".to_string());
+        active_runs_by_session
+            .write()
+            .await
+            .insert("session-b".to_string(), "run-2".to_string());
+
+        let mut keys: Vec<String> = active_runs_by_session
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["session-a", "session-b"]);
     }
 }

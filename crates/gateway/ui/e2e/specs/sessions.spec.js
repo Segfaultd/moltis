@@ -157,6 +157,33 @@ test.describe("Session management", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
+	test("stop action appears for active run and clears after abort", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await page.goto("/");
+		await waitForWsConnected(page);
+		await expectPageContentMounted(page);
+
+		const stopBtn = page.locator('button[title="Stop generation"]');
+		await expect(stopBtn).toHaveCount(0);
+		await expect(page.locator('button[title="Clear session"]')).toBeVisible();
+
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "thinking",
+				runId: "run-stop-e2e",
+			},
+		});
+
+		await expect(stopBtn).toBeVisible();
+		await stopBtn.click();
+		await expect(stopBtn).toHaveCount(0);
+		await expect(page.locator('button[title="Clear session"]')).toBeVisible();
+
+		expect(pageErrors).toEqual([]);
+	});
+
 	test("share button creates cutoff notice and copyable link", async ({ page }) => {
 		const pageErrors = await navigateAndWait(page, "/");
 		await waitForWsConnected(page);
@@ -451,6 +478,30 @@ test.describe("Session management", () => {
 		// Dismiss the dialog by clicking Cancel
 		await page.locator(".provider-modal-backdrop .provider-btn-secondary").click();
 		await expect(page.locator(".provider-modal-backdrop")).toHaveCount(0);
+
+		expect(pageErrors).toEqual([]);
+	});
+
+	test("toggling sandbox shows chat notice", async ({ page }) => {
+		const pageErrors = await navigateAndWait(page, "/chats/main");
+		await waitForWsConnected(page);
+
+		// Enable sandbox via RPC patch
+		await expectRpcOk(page, "sessions.patch", {
+			key: "main",
+			sandboxEnabled: true,
+		});
+
+		// The chat notice should appear as a system message
+		await expect(page.locator(".msg.system").filter({ hasText: "Sandbox enabled" })).toBeVisible({ timeout: 5_000 });
+
+		// Disable sandbox
+		await expectRpcOk(page, "sessions.patch", {
+			key: "main",
+			sandboxEnabled: false,
+		});
+
+		await expect(page.locator(".msg.system").filter({ hasText: "Sandbox disabled" })).toBeVisible({ timeout: 5_000 });
 
 		expect(pageErrors).toEqual([]);
 	});

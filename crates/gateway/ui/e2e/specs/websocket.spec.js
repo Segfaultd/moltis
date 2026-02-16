@@ -142,6 +142,110 @@ test.describe("WebSocket connection lifecycle", () => {
 		expect(pageErrors).toEqual([]);
 	});
 
+	test("voice fallback action and warning render for voice final without audio", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await page.goto("/chats/main");
+		await waitForWsConnected(page);
+		await expectRpcOk(page, "chat.clear", {});
+
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "final",
+				text: "voice fallback should be available",
+				messageIndex: 999901,
+				model: "test-model",
+				provider: "test-provider",
+				replyMedium: "voice",
+				audioWarning: "TTS synthesis failed: timeout",
+			},
+		});
+
+		var assistant = page.locator("#messages .msg.assistant").last();
+		await expect(assistant).toContainText("voice fallback should be available");
+		await expect(assistant.locator(".msg-voice-warning")).toContainText("timeout");
+		await expect(assistant.locator(".msg-voice-action")).toHaveText("Voice it");
+		expect(pageErrors).toEqual([]);
+	});
+
+	test("voice fallback action shows error when generation RPC fails", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await page.goto("/chats/main");
+		await waitForWsConnected(page);
+		await expectRpcOk(page, "chat.clear", {});
+
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "final",
+				text: "try generating voice now",
+				messageIndex: 999902,
+				model: "test-model",
+				provider: "test-provider",
+				replyMedium: "voice",
+			},
+		});
+
+		var assistant = page.locator("#messages .msg.assistant").last();
+		await expect(assistant.locator(".msg-voice-action")).toHaveText("Voice it");
+		await assistant.locator(".msg-voice-action").click();
+		await expect(assistant.locator(".msg-voice-action")).toHaveText("Retry voice");
+		await expect(assistant.locator(".msg-voice-warning")).not.toHaveText("");
+		expect(pageErrors).toEqual([]);
+	});
+
+	test("final event is rendered even if switchInProgress gets stuck", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await page.goto("/chats/main");
+		await waitForWsConnected(page);
+		await expectRpcOk(page, "chat.clear", {});
+
+		await page.evaluate(async () => {
+			const appScript = document.querySelector('script[type="module"][src*="js/app.js"]');
+			if (!appScript) throw new Error("app module script not found");
+			const appUrl = new URL(appScript.src, window.location.origin);
+			const prefix = appUrl.href.slice(0, appUrl.href.length - "js/app.js".length);
+			const sessionStoreModule = await import(`${prefix}js/stores/session-store.js`);
+			const stateModule = await import(`${prefix}js/state.js`);
+			sessionStoreModule.sessionStore.switchInProgress.value = true;
+			stateModule.setSessionSwitchInProgress(true);
+		});
+
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "final",
+				text: "render this final despite stale switch flag",
+				messageIndex: 991001,
+				model: "test-model",
+				provider: "test-provider",
+				replyMedium: "text",
+				runId: "run-stuck-switch-final",
+			},
+		});
+
+		await expect(
+			page.locator("#messages .msg.assistant").filter({ hasText: "render this final despite stale switch flag" }),
+		).toBeVisible();
+		await expect
+			.poll(() =>
+				page.evaluate(async () => {
+					const appScript = document.querySelector('script[type="module"][src*="js/app.js"]');
+					if (!appScript) return null;
+					const appUrl = new URL(appScript.src, window.location.origin);
+					const prefix = appUrl.href.slice(0, appUrl.href.length - "js/app.js".length);
+					const sessionStoreModule = await import(`${prefix}js/stores/session-store.js`);
+					return sessionStoreModule.sessionStore.switchInProgress.value;
+				}),
+			)
+			.toBe(false);
+
+		expect(pageErrors).toEqual([]);
+	});
+
 	test("out-of-order tool events still resolve exec card", async ({ page }) => {
 		const pageErrors = watchPageErrors(page);
 		await page.goto("/chats/main");
@@ -274,6 +378,131 @@ test.describe("WebSocket connection lifecycle", () => {
 			"src",
 			/\/assets\/v\/[^/]+\/icons\/map-openstreetmap\.svg$/,
 		);
+		expect(pageErrors).toEqual([]);
+	});
+
+	test("thinking text is preserved as reasoning disclosure when tool call follows", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await page.goto("/chats/main");
+		await waitForWsConnected(page);
+
+		await expectRpcOk(page, "chat.clear", {});
+
+		// 1. thinking indicator appears
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: { sessionKey: "main", state: "thinking", runId: "run-think-tool" },
+		});
+		await expect(page.locator("#thinkingIndicator")).toBeVisible();
+
+		// 2. thinking text arrives
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "thinking_text",
+				runId: "run-think-tool",
+				text: "I need to search the web for recent news",
+			},
+		});
+		await expect(page.locator("#thinkingIndicator .thinking-text")).toContainText("I need to search the web");
+
+		// 3. thinking_done — indicator should NOT be removed yet
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: { sessionKey: "main", state: "thinking_done", runId: "run-think-tool" },
+		});
+		await expect(page.locator("#thinkingIndicator")).toBeVisible();
+
+		// 4. tool_call_start — thinking text is preserved as disclosure, indicator removed
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "tool_call_start",
+				runId: "run-think-tool",
+				toolCallId: "tc-web-search-1",
+				toolName: "web_search",
+				arguments: { query: "top news today" },
+			},
+		});
+		await expect(page.locator("#thinkingIndicator")).toHaveCount(0);
+		// Reasoning disclosure is inside the tool card
+		const toolCard = page.locator("#tool-run-think-tool-tc-web-search-1");
+		await expect(toolCard).toBeVisible();
+		await expect(toolCard.locator(".msg-reasoning")).toBeVisible();
+		await expect(toolCard.locator(".msg-reasoning-body")).toContainText("I need to search the web for recent news");
+
+		// 5. final with same reasoning should NOT duplicate the disclosure
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "final",
+				text: "Here are the top news stories.",
+				messageIndex: 999998,
+				model: "test-model",
+				provider: "test-provider",
+				replyMedium: "text",
+				reasoning: "I need to search the web for recent news",
+			},
+		});
+		// Only one reasoning disclosure should exist (the preserved one, not a duplicate)
+		await expect(page.locator(".msg-reasoning")).toHaveCount(1);
+		expect(pageErrors).toEqual([]);
+	});
+
+	test("whitespace-only streamed assistant bubble is removed once tool call starts/finalizes", async ({ page }) => {
+		const pageErrors = watchPageErrors(page);
+		await page.goto("/chats/main");
+		await waitForWsConnected(page);
+		await expectRpcOk(page, "chat.clear", {});
+
+		// Simulate an assistant stream that emits only whitespace before deciding to call a tool.
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "delta",
+				runId: "run-whitespace-tool",
+				text: " \n\t ",
+			},
+		});
+		await expect(page.locator("#messages .msg.assistant")).toHaveCount(0);
+
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "tool_call_start",
+				runId: "run-whitespace-tool",
+				toolCallId: "tc-empty-1",
+				toolName: "exec",
+				arguments: { command: "echo $FOO" },
+			},
+		});
+
+		const toolCard = page.locator("#tool-run-whitespace-tool-tc-empty-1");
+		await expect(toolCard).toBeVisible();
+		await expect(page.locator("#messages .msg.assistant")).toHaveCount(0);
+
+		// Final text is also whitespace-only. No empty assistant bubble should be left behind.
+		await expectRpcOk(page, "system-event", {
+			event: "chat",
+			payload: {
+				sessionKey: "main",
+				state: "final",
+				runId: "run-whitespace-tool",
+				text: "\n  \t",
+				messageIndex: 999997,
+				model: "test-model",
+				provider: "test-provider",
+				replyMedium: "text",
+			},
+		});
+
+		await expect(page.locator("#messages .msg.assistant")).toHaveCount(0);
+		await expect(toolCard.locator(".msg-model-footer")).toBeVisible();
 		expect(pageErrors).toEqual([]);
 	});
 

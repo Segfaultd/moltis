@@ -168,6 +168,7 @@ fn build_schema_map() -> KnownKeys {
             ("cache_ttl_minutes", Leaf),
             ("max_redirects", Leaf),
             ("readability", Leaf),
+            ("ssrf_allowlist", Leaf),
         ]))
     };
 
@@ -199,6 +200,7 @@ fn build_schema_map() -> KnownKeys {
             ("sandbox", Leaf),
             ("sandbox_image", Leaf),
             ("allowed_domains", Leaf),
+            ("low_memory_threshold_mb", Leaf),
         ]))
     };
 
@@ -226,6 +228,15 @@ fn build_schema_map() -> KnownKeys {
         ]))
     };
 
+    let mcp_oauth_override = || {
+        Struct(HashMap::from([
+            ("client_id", Leaf),
+            ("auth_url", Leaf),
+            ("token_url", Leaf),
+            ("scopes", Leaf),
+        ]))
+    };
+
     let mcp_server_entry = || {
         Struct(HashMap::from([
             ("command", Leaf),
@@ -234,6 +245,7 @@ fn build_schema_map() -> KnownKeys {
             ("enabled", Leaf),
             ("transport", Leaf),
             ("url", Leaf),
+            ("oauth", mcp_oauth_override()),
         ]))
     };
 
@@ -360,6 +372,7 @@ fn build_schema_map() -> KnownKeys {
             Struct(HashMap::from([
                 ("backend", Leaf),
                 ("provider", Leaf),
+                ("disable_rag", Leaf),
                 ("base_url", Leaf),
                 ("model", Leaf),
                 ("api_key", Leaf),
@@ -400,6 +413,7 @@ fn build_schema_map() -> KnownKeys {
                 ("rate_limit_window_secs", Leaf),
             ])),
         ),
+        ("env", Map(Box::new(Leaf))),
         (
             "voice",
             Struct(HashMap::from([
@@ -756,6 +770,10 @@ fn check_provider_names(
         if PROVIDERS_META_KEYS.contains(&name.as_str()) {
             continue;
         }
+        // Custom providers (user-added OpenAI-compatible endpoints) are valid.
+        if name.starts_with("custom-") {
+            continue;
+        }
         if !KNOWN_PROVIDER_NAMES.contains(&name.as_str()) {
             let suggestion = suggest(name, KNOWN_PROVIDER_NAMES, 3);
             let msg = if let Some(s) = suggestion {
@@ -829,6 +847,28 @@ fn check_semantic_warnings(config: &MoltisConfig, diagnostics: &mut Vec<Diagnost
             category: "security",
             path: "tools.exec.sandbox.mode".into(),
             message: "sandbox mode is disabled — commands run without isolation".into(),
+        });
+    }
+
+    // SSRF allowlist CIDR validation
+    for (idx, entry) in config.tools.web.fetch.ssrf_allowlist.iter().enumerate() {
+        if entry.parse::<ipnet::IpNet>().is_err() {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                category: "security",
+                path: format!("tools.web.fetch.ssrf_allowlist[{idx}]"),
+                message: format!(
+                    "\"{entry}\" is not a valid CIDR range (expected e.g. \"172.22.0.0/16\")"
+                ),
+            });
+        }
+    }
+    if !config.tools.web.fetch.ssrf_allowlist.is_empty() {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            category: "security",
+            path: "tools.web.fetch.ssrf_allowlist".into(),
+            message: "ssrf_allowlist is set — SSRF protection is relaxed for the listed ranges. Ensure these are trusted networks.".into(),
         });
     }
 
@@ -1420,6 +1460,23 @@ provider = "pinecone"
     }
 
     #[test]
+    fn memory_disable_rag_is_valid_field() {
+        let toml = r#"
+[memory]
+disable_rag = true
+"#;
+        let result = validate_toml_str(toml);
+        let unknown = result
+            .diagnostics
+            .iter()
+            .find(|d| d.category == "unknown-field" && d.path == "memory.disable_rag");
+        assert!(
+            unknown.is_none(),
+            "memory.disable_rag should be accepted as a known field"
+        );
+    }
+
+    #[test]
     fn unknown_sandbox_backend_warned() {
         let toml = r#"
 [tools.exec.sandbox]
@@ -1689,6 +1746,71 @@ enabled = true
         assert!(
             warnings.is_empty(),
             "known providers should not be warned about: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn env_section_passes_validation() {
+        let toml = r#"
+[env]
+BRAVE_API_KEY = "test-key"
+OPENROUTER_API_KEY = "sk-or-test"
+CUSTOM_VAR = "some-value"
+"#;
+        let result = validate_toml_str(toml);
+        let errors: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.severity == Severity::Error)
+            .collect();
+        assert!(
+            errors.is_empty(),
+            "env section should not produce errors: {errors:?}"
+        );
+        let unknown_fields: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.category == "unknown-field" && d.path.starts_with("env"))
+            .collect();
+        assert!(
+            unknown_fields.is_empty(),
+            "env keys should not be flagged as unknown: {unknown_fields:?}"
+        );
+    }
+
+    #[test]
+    fn custom_provider_prefix_suppresses_unknown_provider_warning() {
+        let toml = r#"
+[providers.custom-together-ai]
+enabled = true
+"#;
+        let result = validate_toml_str(toml);
+        let unknown_providers: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.category == "unknown-provider")
+            .collect();
+        assert!(
+            unknown_providers.is_empty(),
+            "custom- prefix should not trigger unknown-provider warning: {unknown_providers:?}"
+        );
+    }
+
+    #[test]
+    fn non_custom_unknown_provider_still_warns() {
+        let toml = r#"
+[providers.typo-anthropc]
+enabled = true
+"#;
+        let result = validate_toml_str(toml);
+        let unknown_providers: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.category == "unknown-provider")
+            .collect();
+        assert!(
+            !unknown_providers.is_empty(),
+            "misspelled provider should trigger unknown-provider warning"
         );
     }
 }

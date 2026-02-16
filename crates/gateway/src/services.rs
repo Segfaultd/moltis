@@ -15,7 +15,7 @@ use {
 pub type ServiceError = String;
 pub type ServiceResult<T = Value> = Result<T, ServiceError>;
 
-fn security_audit(event: &str, details: serde_json::Value) {
+fn security_audit(event: &str, details: Value) {
     let dir = moltis_config::data_dir().join("logs");
     let path = dir.join("security-audit.jsonl");
     let now_ms = std::time::SystemTime::now()
@@ -50,7 +50,7 @@ async fn command_available(command: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn run_mcp_scan(installed_dir: &Path) -> anyhow::Result<serde_json::Value> {
+async fn run_mcp_scan(installed_dir: &Path) -> anyhow::Result<Value> {
     let mut cmd = if command_available("uvx").await {
         let mut c = tokio::process::Command::new("uvx");
         c.arg("mcp-scan@latest");
@@ -79,7 +79,7 @@ async fn run_mcp_scan(installed_dir: &Path) -> anyhow::Result<serde_json::Value>
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let parsed: serde_json::Value = serde_json::from_str(&stdout)
+    let parsed: Value = serde_json::from_str(&stdout)
         .map_err(|e| anyhow::anyhow!("invalid mcp-scan JSON output: {e}"))?;
     Ok(parsed)
 }
@@ -214,6 +214,7 @@ pub trait SessionService: Send + Sync {
     async fn preview(&self, params: Value) -> ServiceResult;
     async fn resolve(&self, params: Value) -> ServiceResult;
     async fn patch(&self, params: Value) -> ServiceResult;
+    async fn voice_generate(&self, params: Value) -> ServiceResult;
     async fn share_create(&self, params: Value) -> ServiceResult;
     async fn share_list(&self, params: Value) -> ServiceResult;
     async fn share_revoke(&self, params: Value) -> ServiceResult;
@@ -245,6 +246,10 @@ impl SessionService for NoopSessionService {
 
     async fn patch(&self, _p: Value) -> ServiceResult {
         Ok(serde_json::json!({}))
+    }
+
+    async fn voice_generate(&self, _p: Value) -> ServiceResult {
+        Err("session voice generation not available".into())
     }
 
     async fn share_create(&self, _p: Value) -> ServiceResult {
@@ -449,6 +454,20 @@ pub trait ChatService: Send + Sync {
     async fn raw_prompt(&self, params: Value) -> ServiceResult;
     /// Return the full messages array (system prompt + history) in OpenAI format.
     async fn full_context(&self, params: Value) -> ServiceResult;
+    /// Return session keys that currently have an active run (model generating).
+    async fn active_session_keys(&self) -> Vec<String> {
+        Vec::new()
+    }
+    /// Return the accumulated thinking text for a session that has an active run,
+    /// so the frontend can restore it after a page reload.
+    async fn active_thinking_text(&self, _session_key: &str) -> Option<String> {
+        None
+    }
+    /// Return whether the active run for this session is using voice reply medium,
+    /// so the frontend can restore `voicePending` state after a page reload.
+    async fn active_voice_pending(&self, _session_key: &str) -> bool {
+        false
+    }
 }
 
 pub struct NoopChatService;
@@ -559,6 +578,12 @@ pub trait McpService: Send + Sync {
     async fn restart(&self, params: Value) -> ServiceResult;
     /// Update an MCP server's configuration.
     async fn update(&self, params: Value) -> ServiceResult;
+    /// Trigger re-authentication for an SSE server.
+    async fn reauth(&self, params: Value) -> ServiceResult;
+    /// Start OAuth for an MCP SSE server.
+    async fn oauth_start(&self, params: Value) -> ServiceResult;
+    /// Complete an MCP OAuth callback.
+    async fn oauth_complete(&self, params: Value) -> ServiceResult;
 }
 
 pub struct NoopMcpService;
@@ -598,6 +623,18 @@ impl McpService for NoopMcpService {
     }
 
     async fn update(&self, _params: Value) -> ServiceResult {
+        Err("MCP not configured".into())
+    }
+
+    async fn reauth(&self, _params: Value) -> ServiceResult {
+        Err("MCP not configured".into())
+    }
+
+    async fn oauth_start(&self, _params: Value) -> ServiceResult {
+        Err("MCP not configured".into())
+    }
+
+    async fn oauth_complete(&self, _params: Value) -> ServiceResult {
         Err("MCP not configured".into())
     }
 }
@@ -1926,6 +1963,8 @@ pub trait ProviderSetupService: Send + Sync {
     async fn save_model(&self, params: Value) -> ServiceResult;
     /// Save multiple model preferences for a provider (replaces existing saved models).
     async fn save_models(&self, params: Value) -> ServiceResult;
+    /// Add a custom OpenAI-compatible provider by endpoint URL and API key.
+    async fn add_custom(&self, params: Value) -> ServiceResult;
 }
 
 // ── Local LLM ───────────────────────────────────────────────────────────────
@@ -2019,6 +2058,10 @@ impl ProviderSetupService for NoopProviderSetupService {
     }
 
     async fn save_models(&self, _p: Value) -> ServiceResult {
+        Err("provider setup not configured".into())
+    }
+
+    async fn add_custom(&self, _p: Value) -> ServiceResult {
         Err("provider setup not configured".into())
     }
 }

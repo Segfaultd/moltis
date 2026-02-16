@@ -202,6 +202,11 @@ pub struct MoltisConfig {
     pub heartbeat: HeartbeatConfig,
     pub voice: VoiceConfig,
     pub cron: CronConfig,
+    /// Environment variables injected into the Moltis process at startup.
+    /// Useful for API keys in Docker where you can't easily set env vars.
+    /// Process env vars take precedence (existing vars are not overwritten).
+    #[serde(default)]
+    pub env: HashMap<String, String>,
 }
 
 /// Voice configuration (TTS and STT).
@@ -782,6 +787,9 @@ pub struct MemoryEmbeddingConfig {
     pub backend: Option<String>,
     /// Embedding provider: "local", "ollama", "openai", "custom", or None for auto-detect.
     pub provider: Option<String>,
+    /// Disable RAG embeddings and force keyword-only memory search.
+    #[serde(default)]
+    pub disable_rag: bool,
     /// Base URL for the embedding API (e.g. "http://localhost:11434/v1" for Ollama).
     pub base_url: Option<String>,
     /// Model name (e.g. "nomic-embed-text" for Ollama, "text-embedding-3-small" for OpenAI).
@@ -947,6 +955,26 @@ pub struct McpServerEntry {
     /// URL for SSE transport. Required when `transport` is "sse".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+    /// Manual OAuth override for servers that don't support standard discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<McpOAuthOverrideEntry>,
+}
+
+/// Manual OAuth configuration override for an MCP server.
+///
+/// Used when the server doesn't implement RFC 9728/8414 discovery or
+/// when dynamic client registration is not available.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpOAuthOverrideEntry {
+    /// The OAuth client ID.
+    pub client_id: String,
+    /// The authorization endpoint URL.
+    pub auth_url: String,
+    /// The token endpoint URL.
+    pub token_url: String,
+    /// OAuth scopes to request.
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 /// Channel configuration.
@@ -994,10 +1022,11 @@ impl Default for TlsConfig {
 }
 
 /// Chat configuration.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ChatConfig {
     /// How to handle messages that arrive while an agent run is active.
+    #[serde(default = "default_message_queue_mode")]
     pub message_queue_mode: MessageQueueMode,
     /// Preferred model IDs to show first in selectors (full or raw model IDs).
     pub priority_models: Vec<String>,
@@ -1006,6 +1035,20 @@ pub struct ChatConfig {
     /// live discovery), so this field is currently ignored.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_models: Vec<String>,
+}
+
+fn default_message_queue_mode() -> MessageQueueMode {
+    MessageQueueMode::Followup
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            message_queue_mode: default_message_queue_mode(),
+            priority_models: Vec::new(),
+            allowed_models: Vec::new(),
+        }
+    }
 }
 
 /// Behaviour when `chat.send()` is called during an active run.
@@ -1143,6 +1186,10 @@ pub struct WebFetchConfig {
     pub max_redirects: u8,
     /// Use readability extraction for HTML pages.
     pub readability: bool,
+    /// CIDR ranges exempt from SSRF blocking (e.g. `["172.22.0.0/16"]`).
+    /// Default: empty (all private IPs blocked).
+    #[serde(default)]
+    pub ssrf_allowlist: Vec<String>,
 }
 
 impl Default for WebFetchConfig {
@@ -1154,6 +1201,7 @@ impl Default for WebFetchConfig {
             cache_ttl_minutes: 15,
             max_redirects: 3,
             readability: true,
+            ssrf_allowlist: Vec::new(),
         }
     }
 }
@@ -1199,10 +1247,18 @@ pub struct BrowserConfig {
     /// Supports wildcards: "*.example.com" matches subdomains.
     #[serde(default)]
     pub allowed_domains: Vec<String>,
+    /// Total system RAM threshold (MB) below which memory-saving Chrome flags
+    /// are injected automatically. Set to 0 to disable. Default: 2048.
+    #[serde(default = "default_low_memory_threshold_mb")]
+    pub low_memory_threshold_mb: u64,
 }
 
 fn default_sandbox_image() -> String {
     "browserless/chrome".to_string()
+}
+
+const fn default_low_memory_threshold_mb() -> u64 {
+    2048
 }
 
 impl Default for BrowserConfig {
@@ -1222,6 +1278,7 @@ impl Default for BrowserConfig {
             chrome_args: Vec::new(),
             sandbox_image: default_sandbox_image(),
             allowed_domains: Vec::new(),
+            low_memory_threshold_mb: default_low_memory_threshold_mb(),
         }
     }
 }
@@ -1692,6 +1749,37 @@ mod tests {
         let loc = GeoLocation::now(37.0, -122.0, Some("San Francisco".to_string()));
         assert_eq!(loc.place.as_deref(), Some("San Francisco"));
         assert!(loc.updated_at.is_some());
+    }
+
+    #[test]
+    fn env_section_parses() {
+        let toml = r#"
+[env]
+BRAVE_API_KEY = "test-key"
+OPENROUTER_API_KEY = "sk-or-test"
+"#;
+        let config: MoltisConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.env.len(), 2);
+        assert_eq!(config.env.get("BRAVE_API_KEY").unwrap(), "test-key");
+        assert_eq!(config.env.get("OPENROUTER_API_KEY").unwrap(), "sk-or-test");
+    }
+
+    #[test]
+    fn env_section_defaults_to_empty() {
+        let config: MoltisConfig = toml::from_str("").unwrap();
+        assert!(config.env.is_empty());
+    }
+
+    #[test]
+    fn chat_config_default_queue_mode_is_followup() {
+        let cfg = ChatConfig::default();
+        assert_eq!(cfg.message_queue_mode, MessageQueueMode::Followup);
+    }
+
+    #[test]
+    fn chat_config_toml_missing_queue_mode_defaults_to_followup() {
+        let cfg: ChatConfig = toml::from_str("").unwrap();
+        assert_eq!(cfg.message_queue_mode, MessageQueueMode::Followup);
     }
 
     #[test]

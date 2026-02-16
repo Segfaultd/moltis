@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "benchmarks"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "codspeed-divan-compat",
  "moltis-agents",
@@ -1590,16 +1590,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dirs-next"
-version = "2.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b98cf8ebf19c3d1b223e151f99a4f9f0690dca41414773390fc824184ac833e1"
-dependencies = [
- "cfg-if",
- "dirs-sys-next",
-]
-
-[[package]]
 name = "dirs-sys"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1607,19 +1597,8 @@ checksum = "e01a3366d27ee9890022452ee61b2b63a67e6f13f58900b651ff5665f0bb1fab"
 dependencies = [
  "libc",
  "option-ext",
- "redox_users 0.5.2",
+ "redox_users",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "dirs-sys-next"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ebda144c4fe02d1f7ea1a7d9641b6fc6b580adcfa024ae48797ecdeb6825b4d"
-dependencies = [
- "libc",
- "redox_users 0.4.6",
- "winapi",
 ]
 
 [[package]]
@@ -4400,12 +4379,13 @@ dependencies = [
 
 [[package]]
 name = "moltis"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "clap",
  "dotenvy",
  "moltis-agents",
+ "moltis-browser",
  "moltis-common",
  "moltis-config",
  "moltis-cron",
@@ -4433,7 +4413,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-agents"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-openai",
@@ -4468,7 +4448,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-auto-reply"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "moltis-agents",
@@ -4484,7 +4464,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-browser"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4508,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-canvas"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "axum",
@@ -4520,7 +4500,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-channels"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4536,7 +4516,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-common"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4552,11 +4532,12 @@ dependencies = [
 
 [[package]]
 name = "moltis-config"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "chrono-tz",
  "directories",
+ "ipnet",
  "moltis-metrics",
  "secrecy 0.8.0",
  "serde",
@@ -4570,16 +4551,16 @@ dependencies = [
 
 [[package]]
 name = "moltis-cron"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
  "chrono-tz",
  "cron",
- "dirs-next",
  "moltis-agents",
  "moltis-common",
+ "moltis-config",
  "moltis-metrics",
  "rstest",
  "serde",
@@ -4593,7 +4574,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-gateway"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "argon2",
@@ -4662,6 +4643,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "urlencoding",
  "uuid",
  "web-push",
@@ -4671,25 +4653,30 @@ dependencies = [
 
 [[package]]
 name = "moltis-mcp"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
  "futures",
+ "mockito",
  "moltis-metrics",
+ "moltis-oauth",
  "reqwest 0.12.28",
+ "secrecy 0.8.0",
  "serde",
  "serde_json",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-test",
  "tracing",
+ "url",
  "uuid",
 ]
 
 [[package]]
 name = "moltis-media"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "image",
@@ -4703,7 +4690,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-memory"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4728,7 +4715,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-metrics"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4746,11 +4733,12 @@ dependencies = [
 
 [[package]]
 name = "moltis-oauth"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "axum",
  "base64 0.22.1",
+ "mockito",
  "moltis-config",
  "moltis-metrics",
  "rand 0.9.2",
@@ -4768,7 +4756,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-onboarding"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "moltis-common",
@@ -4784,7 +4772,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-plugins"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4803,7 +4791,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-projects"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4820,7 +4808,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-protocol"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "moltis-metrics",
  "serde",
@@ -4830,7 +4818,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-qmd"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4844,7 +4832,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-routing"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "moltis-common",
@@ -4857,7 +4845,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-sessions"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "fd-lock",
@@ -4874,7 +4862,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-skills"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4895,7 +4883,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-slack"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4919,7 +4907,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-telegram"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4944,13 +4932,14 @@ dependencies = [
 
 [[package]]
 name = "moltis-tools"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
  "futures",
  "image",
+ "ipnet",
  "mockito",
  "moltis-agents",
  "moltis-browser",
@@ -4965,6 +4954,7 @@ dependencies = [
  "secrecy 0.8.0",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "tempfile",
  "tokio",
@@ -4976,7 +4966,7 @@ dependencies = [
 
 [[package]]
 name = "moltis-voice"
-version = "0.8.28"
+version = "0.8.35"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5932,17 +5922,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "49f3fe0889e69e2ae9e41f4d6c4c0181701d00e4697b356fb1f74173a5e0ee27"
 dependencies = [
  "bitflags 2.10.0",
-]
-
-[[package]]
-name = "redox_users"
-version = "0.4.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba009ff324d1fc1b900bd1fdb31564febe58a8ccc8a6fdbb93b543d33b13ca43"
-dependencies = [
- "getrandom 0.2.17",
- "libredox",
- "thiserror 1.0.69",
 ]
 
 [[package]]

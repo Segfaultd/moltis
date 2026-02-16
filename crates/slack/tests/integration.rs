@@ -67,7 +67,7 @@ fn build_state() -> (AccountStateMap, Arc<Sink>) {
         cancel: tokio_util::sync::CancellationToken::new(),
         message_log: None::<Arc<dyn MessageLog>>,
         event_sink: Some(sink.clone()),
-        otp: std::sync::Mutex::new(moltis_channels::otp::OtpState::new(300)),
+        otp: Mutex::new(moltis_channels::otp::OtpState::new(300)),
     };
     accounts
         .write()

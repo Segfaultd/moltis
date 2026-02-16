@@ -2,6 +2,7 @@
 
 import {
 	appendChannelFooter,
+	appendReasoningDisclosure,
 	chatAddMsg,
 	chatAddMsgWithImages,
 	highlightAndScroll,
@@ -19,6 +20,7 @@ import {
 	sendRpc,
 	toolCallSummary,
 } from "./helpers.js";
+import { attachMessageVoiceControl } from "./message-voice.js";
 import { updateSessionProjectSelect } from "./project-combo.js";
 import { currentPrefix, navigate, sessionPath } from "./router.js";
 import { updateSandboxImageUI, updateSandboxUI } from "./sandbox.js";
@@ -84,7 +86,11 @@ export function clearActiveSession() {
 			updateTokenBar();
 			var activeKey = sessionStore.activeSessionKey.value || S.activeSessionKey;
 			var session = sessionStore.getByKey(activeKey);
-			if (session) session.syncCounts(0, 0);
+			if (session) {
+				session.syncCounts(0, 0);
+				session.replying.value = false;
+				session.activeRunId.value = null;
+			}
 			fetchSessions();
 			return res;
 		}
@@ -123,6 +129,13 @@ export function setSessionReplying(key, replying) {
 	// Dual-write: update plain S.sessions object
 	var entry = S.sessions.find((s) => s.key === key);
 	if (entry) entry._replying = replying;
+}
+
+export function setSessionActiveRunId(key, runId) {
+	var session = sessionStore.getByKey(key);
+	if (session) session.activeRunId.value = runId || null;
+	var entry = S.sessions.find((s) => s.key === key);
+	if (entry) entry._activeRunId = runId || null;
 }
 
 export function setSessionUnread(key, unread) {
@@ -356,12 +369,31 @@ function renderHistoryAssistantMessage(msg) {
 				textWrap.innerHTML = renderMarkdown(msg.content); // eslint-disable-line no-unsanitized/property
 				el.appendChild(textWrap);
 			}
+			if (msg.reasoning) {
+				appendReasoningDisclosure(el, msg.reasoning);
+			}
 		}
 	} else {
 		el = chatAddMsg("assistant", renderMarkdown(msg.content || ""), true);
+		if (el && msg.reasoning) {
+			appendReasoningDisclosure(el, msg.reasoning);
+		}
 	}
 	if (el && msg.model) {
-		el.appendChild(createModelFooter(msg));
+		var footer = createModelFooter(msg);
+		el.appendChild(footer);
+		void attachMessageVoiceControl({
+			messageEl: el,
+			footerEl: footer,
+			sessionKey: S.activeSessionKey,
+			text: msg.content || "",
+			runId: msg.run_id || null,
+			messageIndex: msg.historyIndex,
+			audioPath: msg.audio || null,
+			audioWarning: null,
+			forceAction: false,
+			autoplayOnGenerate: true,
+		});
 	}
 	if (msg.inputTokens || msg.outputTokens) {
 		S.sessionTokens.input += msg.inputTokens || 0;
@@ -426,6 +458,11 @@ function renderHistoryToolResult(msg) {
 		card.appendChild(errMsg);
 	}
 
+	// Append reasoning disclosure if this tool call carried thinking text.
+	if (msg.reasoning) {
+		appendReasoningDisclosure(card, msg.reasoning);
+	}
+
 	if (S.chatMsgBox) S.chatMsgBox.appendChild(card);
 	return card;
 }
@@ -462,11 +499,16 @@ function makeThinkingDots() {
 	return tpl.content.cloneNode(true).firstElementChild;
 }
 
-function postHistoryLoadActions(key, searchContext, msgEls) {
+function postHistoryLoadActions(key, searchContext, msgEls, thinkingText) {
 	sendRpc("chat.context", {}).then((ctxRes) => {
 		if (ctxRes?.ok && ctxRes.payload) {
 			if (ctxRes.payload.tokenUsage) {
-				S.setSessionContextWindow(ctxRes.payload.tokenUsage.contextWindow || 0);
+				var tu = ctxRes.payload.tokenUsage;
+				S.setSessionContextWindow(tu.contextWindow || 0);
+				S.setSessionTokens({
+					input: tu.inputTokens || 0,
+					output: tu.outputTokens || 0,
+				});
 			}
 			S.setSessionToolsEnabled(ctxRes.payload.supportsTools !== false);
 		}
@@ -486,7 +528,14 @@ function postHistoryLoadActions(key, searchContext, msgEls) {
 		var thinkEl = document.createElement("div");
 		thinkEl.className = "msg assistant thinking";
 		thinkEl.id = "thinkingIndicator";
-		thinkEl.appendChild(makeThinkingDots());
+		if (thinkingText) {
+			var textEl = document.createElement("span");
+			textEl.className = "thinking-text";
+			textEl.textContent = thinkingText;
+			thinkEl.appendChild(textEl);
+		} else {
+			thinkEl.appendChild(makeThinkingDots());
+		}
 		S.chatMsgBox.appendChild(thinkEl);
 		scrollChatToBottom();
 	}
@@ -638,9 +687,22 @@ export function switchSession(key, searchContext, projectId) {
 				sEntry.lastSeenMessageCount = history.length;
 				sEntry._localUnread = false;
 			}
+			// Restore server-side replying state so thinking dots appear
+			// after a full page reload while the model is still generating.
+			if (res.payload.replying) {
+				setSessionReplying(key, true);
+				// Restore voice-pending state so the final handler renders
+				// the audio player instead of treating it as a text stream.
+				if (res.payload.voicePending) {
+					S.setVoicePending(true);
+					var voiceSession = sessionStore.getByKey(key);
+					if (voiceSession) voiceSession.voicePending.value = true;
+				}
+			}
 			sessionStore.switchInProgress.value = false;
 			S.setSessionSwitchInProgress(false);
-			postHistoryLoadActions(key, searchContext, msgEls);
+			var thinkingText = res.payload.replying ? res.payload.thinkingText || null : null;
+			postHistoryLoadActions(key, searchContext, msgEls, thinkingText);
 			if (S.chatInput) S.chatInput.focus();
 		} else {
 			sessionStore.switchInProgress.value = false;

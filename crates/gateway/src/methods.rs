@@ -132,6 +132,7 @@ const WRITE_METHODS: &[&str] = &[
     "providers.save_models",
     "providers.validate_key",
     "providers.remove_key",
+    "providers.add_custom",
     "providers.oauth.start",
     "providers.oauth.complete",
     "providers.local.configure",
@@ -143,6 +144,7 @@ const WRITE_METHODS: &[&str] = &[
     "channels.senders.deny",
     "sessions.switch",
     "sessions.fork",
+    "sessions.voice.generate",
     "sessions.clear_all",
     "sessions.share.create",
     "sessions.share.revoke",
@@ -162,7 +164,10 @@ const WRITE_METHODS: &[&str] = &[
     "mcp.enable",
     "mcp.disable",
     "mcp.restart",
+    "mcp.reauth",
     "mcp.update",
+    "mcp.oauth.start",
+    "mcp.oauth.complete",
     "cron.add",
     "cron.update",
     "cron.remove",
@@ -1262,12 +1267,30 @@ impl MethodRegistry {
             "sessions.list",
             Box::new(|ctx| {
                 Box::pin(async move {
-                    ctx.state
+                    let mut result = ctx
+                        .state
                         .services
                         .session
                         .list()
                         .await
-                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))?;
+
+                    // Inject replying state so the frontend can restore the
+                    // thinking indicator after a full page reload.
+                    let active_keys = ctx.state.chat().await.active_session_keys().await;
+                    if let Some(arr) = result.as_array_mut() {
+                        for entry in arr {
+                            let key_str =
+                                entry.get("key").and_then(|v| v.as_str()).map(String::from);
+                            if let (Some(key), Some(obj)) = (key_str, entry.as_object_mut()) {
+                                obj.insert(
+                                    "replying".to_string(),
+                                    serde_json::Value::Bool(active_keys.iter().any(|k| k == &key)),
+                                );
+                            }
+                        }
+                    }
+                    Ok(result)
                 })
             }),
         );
@@ -1320,6 +1343,7 @@ impl MethodRegistry {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let sandbox_toggled = ctx.params.get("sandboxEnabled").is_some();
                     let result = ctx
                         .state
                         .services
@@ -1339,7 +1363,43 @@ impl MethodRegistry {
                         BroadcastOpts::default(),
                     )
                     .await;
+                    if sandbox_toggled {
+                        let enabled = result
+                            .get("sandbox_enabled")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        let message = if enabled {
+                            "Sandbox enabled — commands now run in container."
+                        } else {
+                            "Sandbox disabled — commands now run on host."
+                        };
+                        broadcast(
+                            &ctx.state,
+                            "chat",
+                            serde_json::json!({
+                                "sessionKey": key,
+                                "state": "notice",
+                                "title": "Sandbox",
+                                "message": message,
+                            }),
+                            BroadcastOpts::default(),
+                        )
+                        .await;
+                    }
                     Ok(result)
+                })
+            }),
+        );
+        self.register(
+            "sessions.voice.generate",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .session
+                        .voice_generate(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
                 })
             }),
         );
@@ -2295,6 +2355,30 @@ impl MethodRegistry {
                         }
                     }
 
+                    // Inject replying state so frontend restores thinking
+                    // indicator and voice-pending state after page reload.
+                    let chat = ctx.state.chat().await;
+                    let active_keys = chat.active_session_keys().await;
+                    let replying = active_keys.iter().any(|k| k == key);
+                    let mut result = result;
+                    if let Some(obj) = result.as_object_mut() {
+                        obj.insert("replying".to_string(), serde_json::Value::Bool(replying));
+                        if replying {
+                            if let Some(text) = chat.active_thinking_text(key).await {
+                                obj.insert(
+                                    "thinkingText".to_string(),
+                                    serde_json::Value::String(text),
+                                );
+                            }
+                            if chat.active_voice_pending(key).await {
+                                obj.insert(
+                                    "voicePending".to_string(),
+                                    serde_json::Value::Bool(true),
+                                );
+                            }
+                        }
+                    }
+
                     Ok(result)
                 })
             }),
@@ -2846,6 +2930,45 @@ impl MethodRegistry {
             }),
         );
         self.register(
+            "mcp.reauth",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .mcp
+                        .reauth(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+        self.register(
+            "mcp.oauth.start",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .mcp
+                        .oauth_start(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+        self.register(
+            "mcp.oauth.complete",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .mcp
+                        .oauth_complete(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+        self.register(
             "mcp.update",
             Box::new(|ctx| {
                 Box::pin(async move {
@@ -3249,6 +3372,20 @@ impl MethodRegistry {
                         .services
                         .provider_setup
                         .remove_key(ctx.params.clone())
+                        .await
+                        .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
+                })
+            }),
+        );
+
+        self.register(
+            "providers.add_custom",
+            Box::new(|ctx| {
+                Box::pin(async move {
+                    ctx.state
+                        .services
+                        .provider_setup
+                        .add_custom(ctx.params.clone())
                         .await
                         .map_err(|e| ErrorShape::new(error_codes::UNAVAILABLE, e))
                 })
@@ -4134,6 +4271,7 @@ impl MethodRegistry {
                     Ok(serde_json::json!({
                         "backend": memory.backend.as_deref().unwrap_or("builtin"),
                         "citations": memory.citations.as_deref().unwrap_or("auto"),
+                        "disable_rag": memory.disable_rag,
                         "llm_reranking": memory.llm_reranking,
                         "session_export": memory.session_export,
                         "qmd_feature_enabled": cfg!(feature = "qmd"),
@@ -4161,6 +4299,7 @@ impl MethodRegistry {
                         .get("llm_reranking")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    let disable_rag = ctx.params.get("disable_rag").and_then(|v| v.as_bool());
                     let session_export = ctx
                         .params
                         .get("session_export")
@@ -4170,11 +4309,17 @@ impl MethodRegistry {
                     // Persist to moltis.toml so the config survives restarts.
                     let backend_str = backend.to_string();
                     let citations_str = citations.to_string();
+                    let mut effective_disable_rag =
+                        moltis_config::discover_and_load().memory.disable_rag;
                     if let Err(e) = moltis_config::update_config(|cfg| {
                         cfg.memory.backend = Some(backend_str.clone());
                         cfg.memory.citations = Some(citations_str.clone());
                         cfg.memory.llm_reranking = llm_reranking;
+                        if let Some(value) = disable_rag {
+                            cfg.memory.disable_rag = value;
+                        }
                         cfg.memory.session_export = session_export;
+                        effective_disable_rag = cfg.memory.disable_rag;
                     }) {
                         tracing::warn!(error = %e, "failed to persist memory config");
                     }
@@ -4182,6 +4327,7 @@ impl MethodRegistry {
                     Ok(serde_json::json!({
                         "backend": backend,
                         "citations": citations,
+                        "disable_rag": effective_disable_rag,
                         "llm_reranking": llm_reranking,
                         "session_export": session_export,
                     }))
@@ -4206,7 +4352,7 @@ impl MethodRegistry {
                                 .command
                                 .clone()
                                 .unwrap_or_else(|| "qmd".into()),
-                            collections: std::collections::HashMap::new(),
+                            collections: HashMap::new(),
                             max_results: config.memory.qmd.max_results.unwrap_or(10),
                             timeout_ms: config.memory.qmd.timeout_ms.unwrap_or(30_000),
                             work_dir: moltis_config::data_dir(),
@@ -5218,7 +5364,7 @@ async fn fetch_elevenlabs_catalog(config: &moltis_config::MoltisConfig) -> serde
     };
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
+        .timeout(Duration::from_secs(8))
         .build();
     let Ok(client) = client else {
         return serde_json::json!({ "voices": [], "models": fallback_models });
@@ -5405,7 +5551,7 @@ async fn check_binary_available(name: &str) -> Option<String> {
 async fn check_coqui_server(endpoint: &str) -> bool {
     // Try to connect to the server's health endpoint
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(Duration::from_secs(2))
         .build()
         .unwrap_or_default();
 
@@ -5419,7 +5565,7 @@ async fn check_coqui_server(endpoint: &str) -> bool {
 /// Check if vLLM server is running (for Voxtral local).
 async fn check_vllm_server(endpoint: &str) -> bool {
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
+        .timeout(Duration::from_secs(2))
         .build()
         .unwrap_or_default();
 

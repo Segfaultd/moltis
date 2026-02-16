@@ -44,8 +44,8 @@ cargo install moltis --git https://github.com/moltis-org/moltis
 - **Streaming responses** — real-time token streaming for a responsive user
   experience, including when tools are enabled (tool calls stream argument
   deltas as they arrive)
-- **Communication channels** — Telegram integration with an extensible channel
-  abstraction for adding others
+- **Communication channels** — Telegram and Slack integration with an extensible
+  channel abstraction for adding others
 - **Web gateway** — HTTP and WebSocket server with a built-in web UI
 - **Session persistence** — SQLite-backed conversation history, session
   management, and per-session run serialization to prevent history corruption
@@ -53,7 +53,7 @@ cargo install moltis --git https://github.com/moltis-org/moltis
   (default 600s) to prevent runaway executions
 - **Sub-agent delegation** — `spawn_agent` tool lets the LLM delegate tasks to
   child agent loops with nesting depth limits and tool filtering
-- **Message queue modes** — `followup` (replay each queued message as a
+- **Message queue modes** — `followup` (default, replay each queued message as a
   separate run) or `collect` (concatenate and send once) when messages arrive
   during an active run
 - **Tool result sanitization** — strips base64 data URIs and long hex blobs,
@@ -488,6 +488,7 @@ Moltis is organized as a Cargo workspace with the following crates:
 | `moltis-agents` | LLM provider integrations |
 | `moltis-channels` | Communication channel abstraction |
 | `moltis-telegram` | Telegram integration |
+| `moltis-slack` | Slack Socket Mode integration |
 | `moltis-config` | Configuration management |
 | `moltis-sessions` | Session persistence |
 | `moltis-memory` | Embeddings-based knowledge base |
@@ -504,7 +505,7 @@ Moltis is organized as a Cargo workspace with the following crates:
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=moltis-org/moltis&type=Date&v=250214)](https://star-history.com/#moltis-org/moltis&Date)
+[![Star History Chart](https://api.star-history.com/svg?repos=moltis-org/moltis&type=date&legend=top-left)](https://www.star-history.com/#moltis-org/moltis&type=date&legend=top-left)
 
 ## License
 

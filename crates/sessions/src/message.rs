@@ -56,6 +56,12 @@ pub enum PersistedMessage {
         output_tokens: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tool_calls: Option<Vec<PersistedToolCall>>,
+        /// Optional provider reasoning/planning text (not final answer text).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
+        /// Raw provider API payload captured during streaming for debugging.
+        #[serde(rename = "llmApiResponse", skip_serializing_if = "Option::is_none")]
+        llm_api_response: Option<serde_json::Value>,
         /// Relative media path for TTS audio (e.g. "media/main/run_abc.ogg").
         #[serde(skip_serializing_if = "Option::is_none")]
         audio: Option<String>,
@@ -87,6 +93,9 @@ pub enum PersistedMessage {
         result: Option<serde_json::Value>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// Provider reasoning/thinking text that preceded this tool call.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reasoning: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         created_at: Option<u64>,
     },
@@ -199,6 +208,8 @@ impl PersistedMessage {
             input_tokens: Some(input_tokens),
             output_tokens: Some(output_tokens),
             tool_calls: None,
+            reasoning: None,
+            llm_api_response: None,
             audio,
             seq: None,
             run_id: None,
@@ -246,6 +257,29 @@ impl PersistedMessage {
             success,
             result,
             error,
+            reasoning: None,
+            created_at: Some(now_ms()),
+        }
+    }
+
+    /// Create a tool execution result message with reasoning text.
+    pub fn tool_result_with_reasoning(
+        tool_call_id: impl Into<String>,
+        tool_name: impl Into<String>,
+        arguments: Option<serde_json::Value>,
+        success: bool,
+        result: Option<serde_json::Value>,
+        error: Option<String>,
+        reasoning: Option<String>,
+    ) -> Self {
+        Self::ToolResult {
+            tool_call_id: tool_call_id.into(),
+            tool_name: tool_name.into(),
+            arguments,
+            success,
+            result,
+            error,
+            reasoning,
             created_at: Some(now_ms()),
         }
     }
@@ -343,6 +377,8 @@ mod tests {
             input_tokens: Some(100),
             output_tokens: Some(50),
             tool_calls: None,
+            reasoning: None,
+            llm_api_response: None,
             audio: None,
             seq: None,
             run_id: None,
@@ -477,6 +513,7 @@ mod tests {
                 provider,
                 input_tokens,
                 output_tokens,
+                reasoning,
                 audio,
                 ..
             } => {
@@ -485,6 +522,7 @@ mod tests {
                 assert_eq!(provider.as_deref(), Some("openai"));
                 assert_eq!(input_tokens, Some(100));
                 assert_eq!(output_tokens, Some(50));
+                assert!(reasoning.is_none());
                 assert!(audio.is_none());
             },
             _ => panic!("expected Assistant message"),
@@ -543,6 +581,7 @@ mod tests {
             success: true,
             result: Some(serde_json::json!({"stdout": "file.txt", "exit_code": 0})),
             error: None,
+            reasoning: None,
             created_at: Some(12345),
         };
         let json = serde_json::to_value(&msg).unwrap();
@@ -564,6 +603,7 @@ mod tests {
             success: false,
             result: None,
             error: Some("command not found".to_string()),
+            reasoning: None,
             created_at: Some(12345),
         };
         let json = serde_json::to_value(&msg).unwrap();
@@ -622,13 +662,62 @@ mod tests {
                 tool_call_id,
                 tool_name,
                 success,
+                reasoning,
                 ..
             } => {
                 assert_eq!(tool_call_id, "call_4");
                 assert_eq!(tool_name, "exec");
                 assert!(success);
+                // Old sessions without reasoning field should deserialize as None.
+                assert!(reasoning.is_none());
             },
             _ => panic!("expected ToolResult message"),
         }
+    }
+
+    #[test]
+    fn tool_result_with_reasoning_roundtrips() {
+        let original = PersistedMessage::tool_result_with_reasoning(
+            "call_5",
+            "web_search",
+            Some(serde_json::json!({"query": "top news"})),
+            true,
+            Some(serde_json::json!({"stdout": "results", "exit_code": 0})),
+            None,
+            Some("I need to search for today's news".to_string()),
+        );
+        let json = original.to_value();
+        assert_eq!(json["reasoning"], "I need to search for today's news");
+
+        let parsed: PersistedMessage = serde_json::from_value(json).unwrap();
+        match parsed {
+            PersistedMessage::ToolResult {
+                tool_call_id,
+                reasoning,
+                ..
+            } => {
+                assert_eq!(tool_call_id, "call_5");
+                assert_eq!(
+                    reasoning.as_deref(),
+                    Some("I need to search for today's news")
+                );
+            },
+            _ => panic!("expected ToolResult message"),
+        }
+    }
+
+    #[test]
+    fn tool_result_without_reasoning_omits_field() {
+        let msg = PersistedMessage::tool_result(
+            "call_6",
+            "exec",
+            None,
+            true,
+            Some(serde_json::json!({"stdout": "ok"})),
+            None,
+        );
+        let json = msg.to_value();
+        // reasoning field should not be present when None.
+        assert!(json.get("reasoning").is_none());
     }
 }

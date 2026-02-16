@@ -83,13 +83,13 @@ impl LiveTtsService {
     }
 
     /// Load fresh TTS config from disk.
-    fn load_config() -> moltis_voice::TtsConfig {
+    fn load_config() -> TtsConfig {
         let cfg = moltis_config::discover_and_load();
-        moltis_voice::TtsConfig {
+        TtsConfig {
             enabled: cfg.voice.tts.enabled,
             provider: cfg.voice.tts.provider.clone(),
             auto: moltis_voice::TtsAutoMode::Off,
-            max_text_length: 2000,
+            max_text_length: 8000,
             elevenlabs: moltis_voice::ElevenLabsConfig {
                 api_key: cfg.voice.tts.elevenlabs.api_key.clone(),
                 voice_id: cfg.voice.tts.elevenlabs.voice_id.clone(),

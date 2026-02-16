@@ -34,11 +34,7 @@ impl WebAuthnState {
     /// `rp_origin` is the full origin URL (e.g. "https://localhost:18080").
     /// `extra_origins` are additional origins accepted during verification (e.g.
     /// `http://m4max.local:18080` when accessing via mDNS hostname).
-    pub fn new(
-        rp_id: &str,
-        rp_origin: &webauthn_rs::prelude::Url,
-        extra_origins: &[webauthn_rs::prelude::Url],
-    ) -> anyhow::Result<Self> {
+    pub fn new(rp_id: &str, rp_origin: &Url, extra_origins: &[Url]) -> anyhow::Result<Self> {
         let mut builder = WebauthnBuilder::new(rp_id, rp_origin)
             .map_err(|e| anyhow::anyhow!("webauthn builder error: {e}"))?;
         for origin in extra_origins {
@@ -82,7 +78,7 @@ impl WebAuthnState {
             .start_passkey_registration(user_id, "owner", "Owner", exclude_opt)
             .map_err(|e| anyhow::anyhow!("start_passkey_registration: {e}"))?;
 
-        let challenge_id = uuid::Uuid::new_v4().to_string();
+        let challenge_id = Uuid::new_v4().to_string();
         self.pending_registrations
             .insert(challenge_id.clone(), PendingRegistration {
                 state: reg_state,
@@ -131,7 +127,7 @@ impl WebAuthnState {
             .start_passkey_authentication(credentials)
             .map_err(|e| anyhow::anyhow!("start_passkey_authentication: {e}"))?;
 
-        let challenge_id = uuid::Uuid::new_v4().to_string();
+        let challenge_id = Uuid::new_v4().to_string();
         self.pending_authentications
             .insert(challenge_id.clone(), PendingAuthentication {
                 state: auth_state,
@@ -185,6 +181,56 @@ impl WebAuthnState {
             .retain(|_, v| v.created_at.elapsed() < cutoff);
         self.pending_authentications
             .retain(|_, v| v.created_at.elapsed() < cutoff);
+    }
+}
+
+/// Registry of WebAuthn instances keyed by RP ID, allowing passkey
+/// registration/authentication from multiple hostnames (e.g. `localhost`
+/// and `m4max.local`).
+pub struct WebAuthnRegistry {
+    entries: Vec<(String, WebAuthnState)>,
+}
+
+impl Default for WebAuthnRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WebAuthnRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Add a WebAuthn instance for the given RP ID.
+    pub fn add(&mut self, rp_id: String, state: WebAuthnState) {
+        self.entries.push((rp_id, state));
+    }
+
+    /// Look up the `WebAuthnState` whose RP ID matches the hostname portion
+    /// of the request's `Host` header.
+    pub fn get_for_host(&self, host: &str) -> Option<&WebAuthnState> {
+        let hostname = host.split(':').next().unwrap_or(host);
+        self.entries
+            .iter()
+            .find(|(rpid, _)| rpid == hostname)
+            .map(|(_, state)| state)
+    }
+
+    /// Return combined allowed origins from all registered instances.
+    pub fn get_all_origins(&self) -> Vec<String> {
+        let mut origins = Vec::new();
+        for (_, state) in &self.entries {
+            for o in state.get_allowed_origins() {
+                if !origins.contains(&o) {
+                    origins.push(o);
+                }
+            }
+        }
+        origins
     }
 }
 

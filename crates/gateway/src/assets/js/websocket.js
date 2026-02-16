@@ -2,6 +2,7 @@
 
 import {
 	appendChannelFooter,
+	appendReasoningDisclosure,
 	chatAddErrorCard,
 	chatAddErrorMsg,
 	chatAddMsg,
@@ -21,6 +22,7 @@ import {
 	toolCallSummary,
 } from "./helpers.js";
 import { clearLogsAlert, updateLogsAlert } from "./logs-alert.js";
+import { attachMessageVoiceControl } from "./message-voice.js";
 import { fetchModels } from "./models.js";
 import { prefetchChannels } from "./page-channels.js";
 import { maybeRefreshFullContext, renderCompactCard } from "./page-chat.js";
@@ -30,6 +32,7 @@ import {
 	appendLastMessageTimestamp,
 	bumpSessionCount,
 	fetchSessions,
+	setSessionActiveRunId,
 	setSessionReplying,
 	setSessionUnread,
 } from "./sessions.js";
@@ -39,7 +42,6 @@ import { connectWs, forceReconnect } from "./ws-connect.js";
 
 // ── Chat event handlers ──────────────────────────────────────
 
-var ttsWebStatus = null; // null = unknown, true/false = enabled state
 var pendingToolCallEnds = new Map();
 
 function toolCallLogicalId(payload) {
@@ -68,34 +70,14 @@ function clearPendingToolCallEndsForSession(sessionKey) {
 	}
 }
 
-async function appendAssistantVoiceIfEnabled(msgEl, text) {
-	if (!(msgEl && text)) return false;
-
-	if (ttsWebStatus === null) {
-		var status = await sendRpc("tts.status", {});
-		ttsWebStatus = status?.ok && status.payload?.enabled === true;
-	}
-	if (!ttsWebStatus) return false;
-
-	var tts = await sendRpc("tts.convert", { text: text, format: "ogg" });
-	if (!(tts?.ok && tts.payload?.audio)) {
-		if (tts?.error) {
-			console.warn("TTS convert failed:", tts.error.message || tts.error);
-		}
-		return false;
-	}
-
-	msgEl.textContent = "";
-
-	var mimeType = tts.payload.mimeType || "audio/ogg";
-	var src = `data:${mimeType};base64,${tts.payload.audio}`;
-	renderAudioPlayer(msgEl, src, true);
-	return true;
-}
-
 function makeThinkingDots() {
 	var tpl = document.getElementById("tpl-thinking-dots");
 	return tpl.content.cloneNode(true).firstElementChild;
+}
+
+function updateSessionRunId(sessionKey, runId) {
+	if (!runId) return;
+	setSessionActiveRunId(sessionKey, runId);
 }
 
 function moveFirstQueuedToChat() {
@@ -113,7 +95,9 @@ function moveFirstQueuedToChat() {
 	if (!tray.querySelector(".msg")) tray.classList.add("hidden");
 }
 
-function handleChatThinking(_p, isActive, isChatPage) {
+function handleChatThinking(p, isActive, isChatPage, eventSession) {
+	updateSessionRunId(eventSession, p.runId);
+	setSessionReplying(eventSession, true);
 	if (!(isActive && isChatPage)) return;
 	removeThinking();
 	var thinkEl = document.createElement("div");
@@ -124,7 +108,9 @@ function handleChatThinking(_p, isActive, isChatPage) {
 	S.chatMsgBox.scrollTop = S.chatMsgBox.scrollHeight;
 }
 
-function handleChatThinkingText(p, isActive, isChatPage) {
+function handleChatThinkingText(p, isActive, isChatPage, eventSession) {
+	updateSessionRunId(eventSession, p.runId);
+	setSessionReplying(eventSession, true);
 	if (!(isActive && isChatPage)) return;
 	var indicator = document.getElementById("thinkingIndicator");
 	if (indicator) {
@@ -138,7 +124,12 @@ function handleChatThinkingText(p, isActive, isChatPage) {
 }
 
 function handleChatThinkingDone(_p, isActive, isChatPage) {
-	if (isActive && isChatPage) removeThinking();
+	// Don't remove the thinking indicator here. It will be removed by either:
+	// - handleChatDelta (when text starts streaming)
+	// - handleChatToolCallStart (which preserves thinking text as a disclosure)
+	// - handleChatFinal / handleChatError (cleanup)
+	// This keeps the thinking text visible until we know whether to preserve it.
+	void (isActive && isChatPage);
 }
 
 function handleChatVoicePending(_p, isActive, isChatPage, eventSession) {
@@ -151,15 +142,43 @@ function handleChatVoicePending(_p, isActive, isChatPage, eventSession) {
 	// Keep the existing thinking dots visible — no separate voice indicator.
 }
 
+/** Check whether a reasoning disclosure with the given text already exists in
+ * the chat box (from a previous preserveThinkingAsDisclosure call). */
+function isReasoningAlreadyShown(text) {
+	if (!(S.chatMsgBox && text)) return false;
+	var normalized = text.trim();
+	for (var el of S.chatMsgBox.querySelectorAll(".msg-reasoning-body")) {
+		if (el.textContent.trim() === normalized) return true;
+	}
+	return false;
+}
+
+/** Extract thinking text from the indicator before it is removed. Returns the
+ * trimmed text or null if the indicator has no thinking content. */
+function extractThinkingText() {
+	var indicator = document.getElementById("thinkingIndicator");
+	if (!indicator) return null;
+	var textEl = indicator.querySelector(".thinking-text");
+	var text = textEl?.textContent.trim();
+	return text || null;
+}
+
 function handleChatToolCallStart(p, isActive, isChatPage, eventSession) {
+	updateSessionRunId(eventSession, p.runId);
 	// Update per-session signal
 	var session = sessionStore.getByKey(eventSession);
 	if (session) session.streamText.value = "";
 	if (!(isActive && isChatPage)) return;
+	var thinkingText = extractThinkingText();
 	removeThinking();
 	// Close the current streaming element so new text deltas after this tool
 	// call will create a fresh element positioned after the tool card
 	if (S.streamEl) {
+		// Remove the element if it's empty (e.g. only whitespace from a
+		// pre-tool-call delta) to avoid leaving an orphaned empty div.
+		if (!S.streamEl.textContent.trim()) {
+			S.streamEl.remove();
+		}
 		S.setStreamEl(null);
 		S.setStreamText("");
 	}
@@ -171,6 +190,8 @@ function handleChatToolCallStart(p, isActive, isChatPage, eventSession) {
 	card.id = cardId;
 	var cmd = toolCallSummary(p.toolName, p.arguments, p.executionMode);
 	card.querySelector("[data-cmd]").textContent = ` ${cmd}`;
+	// Preserve thinking text as a reasoning disclosure inside the tool card
+	if (thinkingText) appendReasoningDisclosure(card, thinkingText);
 	S.chatMsgBox.appendChild(card);
 	var endKey = toolCallEventKey(eventSession, p);
 	var pendingEnd = pendingToolCallEnds.get(endKey);
@@ -268,6 +289,7 @@ function clearStaleRunningToolCards() {
 }
 
 function handleChatToolCallEnd(p, isActive, isChatPage, eventSession) {
+	updateSessionRunId(eventSession, p.runId);
 	// Always bump badge — the server persists a tool_result message for each call.
 	bumpSessionCount(eventSession, 1);
 	if (!(isActive && isChatPage)) return;
@@ -305,7 +327,12 @@ function setSafeMarkdownHtml(el, text) {
 	el.innerHTML = renderMarkdown(text); // eslint-disable-line no-unsanitized/property
 }
 
+function hasNonWhitespaceContent(text) {
+	return String(text || "").trim().length > 0;
+}
+
 function handleChatDelta(p, isActive, isChatPage, eventSession) {
+	updateSessionRunId(eventSession, p.runId);
 	if (!p.text) return;
 	// Update per-session signal
 	var session = sessionStore.getByKey(eventSession);
@@ -316,6 +343,13 @@ function handleChatDelta(p, isActive, isChatPage, eventSession) {
 		S.setStreamText(S.streamText + p.text);
 		return;
 	}
+	// Skip leading whitespace before any real content has been streamed.
+	// Some providers emit newlines between thinking and content; rendering
+	// them would create an empty assistant div that lingers if a tool call
+	// follows immediately.  We must check this BEFORE removeThinking() so
+	// the thinking text is still available for handleChatToolCallStart to
+	// extract into a reasoning disclosure on the tool card.
+	if (!(S.streamEl || p.text.trim())) return;
 	removeThinking();
 	if (!S.streamEl) {
 		S.setStreamText("");
@@ -344,13 +378,15 @@ function isPureToolOutputEcho(finalText, toolOutput) {
 }
 
 function resolveFinalMessageEl(p) {
-	var isEcho = isPureToolOutputEcho(p.text, S.lastToolOutput);
+	var finalText = String(p.text || "");
+	var hasFinalText = hasNonWhitespaceContent(finalText);
+	var isEcho = hasFinalText && isPureToolOutputEcho(finalText, S.lastToolOutput);
 	if (!isEcho) {
-		if (p.text && S.streamEl) {
-			setSafeMarkdownHtml(S.streamEl, p.text);
+		if (hasFinalText && S.streamEl) {
+			setSafeMarkdownHtml(S.streamEl, finalText);
 			return S.streamEl;
 		}
-		if (p.text) return chatAddMsg("assistant", renderMarkdown(p.text), true);
+		if (hasFinalText) return chatAddMsg("assistant", renderMarkdown(finalText), true);
 		// No text (silent reply) — remove any leftover stream element.
 		if (S.streamEl) S.streamEl.remove();
 		return null;
@@ -359,7 +395,7 @@ function resolveFinalMessageEl(p) {
 	return null;
 }
 
-function appendFinalFooter(msgEl, p) {
+function appendFinalFooter(msgEl, p, eventSession) {
 	if (!(msgEl && p.model)) return;
 	var footer = document.createElement("div");
 	footer.className = "msg-model-footer";
@@ -375,11 +411,25 @@ function appendFinalFooter(msgEl, p) {
 		footer.appendChild(badge);
 	}
 	msgEl.appendChild(footer);
+
+	void attachMessageVoiceControl({
+		messageEl: msgEl,
+		footerEl: footer,
+		sessionKey: p.sessionKey || eventSession || S.activeSessionKey,
+		text: p.text || "",
+		runId: p.runId,
+		messageIndex: p.messageIndex,
+		audioPath: p.audio || null,
+		audioWarning: p.audioWarning || null,
+		forceAction: p.replyMedium === "voice" && !p.audio,
+		autoplayOnGenerate: true,
+	});
 }
 
 // biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Final message handling with audio/voice branching
 function handleChatFinal(p, isActive, isChatPage, eventSession) {
 	clearPendingToolCallEndsForSession(eventSession);
+	updateSessionRunId(eventSession, p.runId);
 	// Always bump badge — the server persists the final assistant message.
 	bumpSessionCount(eventSession, 1);
 	// Compare against the per-session history index so cross-session
@@ -388,9 +438,11 @@ function handleChatFinal(p, isActive, isChatPage, eventSession) {
 	var lastIdx = evtSession ? evtSession.lastHistoryIndex.value : S.lastHistoryIndex;
 	if (p.messageIndex !== undefined && p.messageIndex <= lastIdx) {
 		setSessionReplying(eventSession, false);
+		setSessionActiveRunId(eventSession, null);
 		return;
 	}
 	setSessionReplying(eventSession, false);
+	setSessionActiveRunId(eventSession, null);
 	if (!isActive) {
 		setSessionUnread(eventSession, true);
 	}
@@ -415,15 +467,27 @@ function handleChatFinal(p, isActive, isChatPage, eventSession) {
 			console.debug("[audio] rendering persisted audio:", filename);
 			renderAudioPlayer(msgEl, audioSrc, true);
 		}
-		// Safe: renderMarkdown calls esc() first — all user input is HTML-escaped.
-		var textWrap = document.createElement("div");
-		textWrap.className = "mt-2";
-		setSafeMarkdownHtml(textWrap, p.text);
-		msgEl.appendChild(textWrap);
-		appendFinalFooter(msgEl, p);
+		if (hasNonWhitespaceContent(p.text)) {
+			// Safe: renderMarkdown calls esc() first — all user input is HTML-escaped.
+			var textWrap = document.createElement("div");
+			textWrap.className = "mt-2";
+			setSafeMarkdownHtml(textWrap, p.text);
+			msgEl.appendChild(textWrap);
+		}
+		if (p.reasoning && !isReasoningAlreadyShown(p.reasoning)) {
+			appendReasoningDisclosure(msgEl, p.reasoning);
+		}
+		appendFinalFooter(msgEl, p, eventSession);
 		S.chatMsgBox.scrollTop = S.chatMsgBox.scrollHeight;
 	} else {
 		var resolvedEl = resolveFinalMessageEl(p);
+		var skipReasoning = p.reasoning && isReasoningAlreadyShown(p.reasoning);
+		if (!resolvedEl && p.reasoning && !skipReasoning) {
+			resolvedEl = chatAddMsg("assistant", "", false);
+		}
+		if (resolvedEl && p.reasoning && !skipReasoning) {
+			appendReasoningDisclosure(resolvedEl, p.reasoning);
+		}
 		if (resolvedEl && p.text && p.replyMedium === "voice") {
 			console.debug(
 				"[audio] streamed path, audio:",
@@ -439,15 +503,10 @@ function handleChatFinal(p, isActive, isChatPage, eventSession) {
 				console.debug("[audio] rendering persisted audio (streamed):", fn2);
 				resolvedEl.textContent = "";
 				renderAudioPlayer(resolvedEl, src2, true);
-				appendFinalFooter(resolvedEl, p);
+				appendFinalFooter(resolvedEl, p, eventSession);
 			} else {
-				console.debug("[audio] no persisted audio, trying web TTS");
-				appendAssistantVoiceIfEnabled(resolvedEl, p.text)
-					.catch((err) => {
-						console.warn("Web UI TTS playback failed:", err);
-						return false;
-					})
-					.finally(() => appendFinalFooter(resolvedEl, p));
+				console.debug("[audio] no persisted audio, showing voice fallback action");
+				appendFinalFooter(resolvedEl, p, eventSession);
 			}
 		} else {
 			// Silent reply — attach footer to the last visible assistant element
@@ -457,7 +516,7 @@ function handleChatFinal(p, isActive, isChatPage, eventSession) {
 				var last = S.chatMsgBox?.lastElementChild;
 				if (last && !last.classList.contains("user")) target = last;
 			}
-			appendFinalFooter(target, p);
+			appendFinalFooter(target, p, eventSession);
 		}
 	}
 	if (p.inputTokens || p.outputTokens) {
@@ -496,9 +555,48 @@ function handleChatAutoCompact(p, isActive, isChatPage) {
 	}
 }
 
+function retryDelayMsFromPayload(p) {
+	if (p.retryAfterMs !== undefined && p.retryAfterMs !== null) return Number(p.retryAfterMs) || 0;
+	if (p.error?.retryAfterMs !== undefined && p.error?.retryAfterMs !== null) return Number(p.error.retryAfterMs) || 0;
+	return 0;
+}
+
+function retryStatusText(p) {
+	var retryMs = retryDelayMsFromPayload(p);
+	var retrySecs = Math.max(1, Math.ceil(retryMs / 1000));
+	var rateLimited = p.error?.type === "rate_limit_exceeded";
+	return rateLimited
+		? `Rate limited by provider, retrying in ${retrySecs}s…`
+		: `Temporary provider issue, retrying in ${retrySecs}s…`;
+}
+
+function handleChatRetrying(p, isActive, isChatPage, eventSession) {
+	updateSessionRunId(eventSession, p.runId);
+	setSessionReplying(eventSession, true);
+	if (!(isActive && isChatPage)) return;
+
+	var indicator = document.getElementById("thinkingIndicator");
+	if (!indicator) {
+		removeThinking();
+		indicator = document.createElement("div");
+		indicator.className = "msg assistant thinking";
+		indicator.id = "thinkingIndicator";
+		indicator.appendChild(makeThinkingDots());
+		S.chatMsgBox.appendChild(indicator);
+	}
+
+	while (indicator.firstChild) indicator.removeChild(indicator.firstChild);
+	var textEl = document.createElement("span");
+	textEl.className = "thinking-text";
+	textEl.textContent = retryStatusText(p);
+	indicator.appendChild(textEl);
+	S.chatMsgBox.scrollTop = S.chatMsgBox.scrollHeight;
+}
+
 function handleChatError(p, isActive, isChatPage, eventSession) {
 	clearPendingToolCallEndsForSession(eventSession);
 	setSessionReplying(eventSession, false);
+	setSessionActiveRunId(eventSession, null);
 	// Reset per-session stream state
 	var errSession = sessionStore.getByKey(eventSession);
 	if (errSession) errSession.resetStreamState();
@@ -539,6 +637,7 @@ function handleChatQueueCleared(_p, isActive, isChatPage) {
 
 function handleChatSessionCleared(_p, isActive, isChatPage, eventSession) {
 	clearPendingToolCallEndsForSession(eventSession);
+	setSessionActiveRunId(eventSession, null);
 	// Reset badge, unread state, and history index for every client.
 	var session = sessionStore.getByKey(eventSession);
 	if (session) {
@@ -567,6 +666,7 @@ var chatHandlers = {
 	delta: handleChatDelta,
 	final: handleChatFinal,
 	auto_compact: handleChatAutoCompact,
+	retrying: handleChatRetrying,
 	error: handleChatError,
 	notice: handleChatNotice,
 	queue_cleared: handleChatQueueCleared,
@@ -578,7 +678,17 @@ function handleChatEvent(p) {
 	var isActive = eventSession === sessionStore.activeSessionKey.value;
 	var isChatPage = currentPrefix === "/chats";
 
-	if (isActive && sessionStore.switchInProgress.value) return;
+	if (isActive && sessionStore.switchInProgress.value) {
+		// If session switching got stuck (e.g. lost RPC response), do not drop
+		// terminal frames. Unstick and process final/error so replies still show
+		// without requiring a full page reload.
+		if (p.state === "final" || p.state === "error") {
+			sessionStore.switchInProgress.value = false;
+			S.setSessionSwitchInProgress(false);
+		} else {
+			return;
+		}
+	}
 
 	if (p.sessionKey && !sessionStore.getByKey(p.sessionKey)) {
 		fetchSessions();
@@ -606,16 +716,25 @@ function handleLogEntry(payload) {
 	}
 }
 
+function updateSandboxBuildingFlag(building) {
+	var info = S.sandboxInfo;
+	if (info) S.setSandboxInfo({ ...info, image_building: building });
+}
+
 function handleSandboxImageBuild(payload) {
+	var phase = payload.phase;
+	// Update the sandboxInfo signal so all pages (chat, settings) reflect the build state.
+	updateSandboxBuildingFlag(phase === "start");
+
 	var isChatPage = currentPrefix === "/chats";
 	if (!isChatPage) return;
-	if (payload.phase === "start") {
+	if (phase === "start") {
 		chatAddMsg("system", "Building sandbox image (installing packages)\u2026");
-	} else if (payload.phase === "done") {
+	} else if (phase === "done") {
 		if (S.chatMsgBox?.lastChild) S.chatMsgBox.removeChild(S.chatMsgBox.lastChild);
 		var msg = payload.built ? `Sandbox image ready: ${payload.tag}` : `Sandbox image already cached: ${payload.tag}`;
 		chatAddMsg("system", msg);
-	} else if (payload.phase === "error") {
+	} else if (phase === "error") {
 		if (S.chatMsgBox?.lastChild) S.chatMsgBox.removeChild(S.chatMsgBox.lastChild);
 		chatAddMsg("error", `Sandbox image build failed: ${payload.error || "unknown"}`);
 	}
@@ -635,6 +754,7 @@ function handleSandboxImageProvision(payload) {
 	}
 }
 
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: Provisioning UI with multiple phases
 function handleSandboxHostProvision(payload) {
 	var isChatPage = currentPrefix === "/chats";
 	if (!isChatPage) return;
@@ -855,6 +975,9 @@ var connectOpts = {
 			second: "2-digit",
 		});
 		chatAddMsg("system", `Connected to moltis gateway v${hello.server.version} at ${ts}`);
+		if (S.sandboxInfo?.image_building) {
+			chatAddMsg("system", "Building sandbox image (installing packages)\u2026");
+		}
 		fetchModels();
 		fetchSessions();
 		fetchProjects();

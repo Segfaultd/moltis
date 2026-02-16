@@ -84,12 +84,12 @@ auto_generate = true              # Auto-generate local CA and server certificat
 #   alias     - Custom name for metrics labels (useful for multiple instances)
 
 [providers]
-offered = ["local-llm", "github-copilot", "openai", "anthropic", "ollama", "moonshot"] # Enabled providers and those shown in onboarding/picker UI ([] = enable/show all)
+offered = ["local-llm", "github-copilot", "openai", "anthropic", "openrouter", "ollama", "moonshot", "minimax", "zai"] # Enabled providers and those shown in onboarding/picker UI ([] = enable/show all)
 # All available providers:
 #   "anthropic", "openai", "gemini", "groq", "xai", "deepseek",
 #   "mistral", "openrouter", "cerebras", "minimax", "moonshot",
-#   "venice", "ollama", "local-llm", "openai-codex", "github-copilot",
-#   "kimi-code"
+#   "zai", "venice", "ollama", "local-llm", "openai-codex",
+#   "github-copilot", "kimi-code"
 
 # ── Anthropic (Claude) ────────────────────────────────────────
 # [providers.anthropic]
@@ -165,7 +165,8 @@ models = ["kimi-k2.5"]                        # Preferred models shown first
 # ══════════════════════════════════════════════════════════════════════════════
 
 [chat]
-message_queue_mode = "followup"   # How to handle messages during an active agent run:
+message_queue_mode = "followup"   # Default: process queued messages one-by-one after the current run.
+                                  # How to handle messages during an active agent run:
                                   #   "followup" - Queue messages, replay one-by-one after run
                                   #   "collect"  - Buffer messages, concatenate as single message
 # priority_models = ["claude-opus-4-5", "gpt-5.2", "gemini-3-flash"]  # Optional: models to pin first in selectors
@@ -342,6 +343,7 @@ timeout_seconds = 30              # HTTP request timeout
 cache_ttl_minutes = 15            # Cache fetched pages for this many minutes (0 = no cache)
 max_redirects = 3                 # Maximum HTTP redirects to follow
 readability = true                # Use readability extraction for HTML (cleaner output)
+# ssrf_allowlist = ["172.22.0.0/16"] # CIDR ranges exempt from SSRF blocking (e.g. Docker networks)
 
 # ── Browser Automation ────────────────────────────────────────────────────────
 # Full browser control via Chrome DevTools Protocol (CDP).
@@ -418,7 +420,7 @@ auto_load = []                    # Skills to always load without explicit activ
 # Example: SSE server
 # [mcp.servers.remote]
 # transport = "sse"
-# url = "http://localhost:8080/sse"
+# url = "http://localhost:8080/mcp"
 # enabled = true
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -518,7 +520,8 @@ reset_on_exit = true              # Reset serve/funnel when gateway shuts down
                                   #   "openai"  - OpenAI API
                                   #   "custom"  - Custom endpoint
                                   #   (none)    - Auto-detect from available providers
-# base_url = "http://localhost:11434/v1"  # API endpoint for embeddings
+# disable_rag = false             # true => keyword-only search (no embeddings)
+# base_url = "http://localhost:11434/v1"  # Embedding API base (host, /v1, or /embeddings)
 # model = "nomic-embed-text"      # Embedding model name
 # api_key = "..."                 # API key (optional for local endpoints like Ollama)
 
@@ -532,6 +535,23 @@ reset_on_exit = true              # Reset serve/funnel when gateway shuts down
 # [channels.telegram.my-bot]
 # token = "..."                   # Bot token from @BotFather
 # allowed_users = []              # Telegram user IDs allowed to chat (empty = all)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HOOKS
+# ══════════════════════════════════════════════════════════════════════════════
+# Shell commands triggered by events.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENVIRONMENT VARIABLES
+# ══════════════════════════════════════════════════════════════════════════════
+# Variables injected into the Moltis process at startup.
+# Useful for API keys in Docker where you can't easily pass env vars.
+# Process env vars (docker -e, host env) take precedence — existing vars
+# are NOT overwritten.
+#
+# [env]
+# BRAVE_API_KEY = "..."
+# OPENROUTER_API_KEY = "sk-or-..."
 
 # ══════════════════════════════════════════════════════════════════════════════
 # HOOKS

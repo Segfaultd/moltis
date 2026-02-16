@@ -100,11 +100,8 @@ pub trait ChannelEventSink: Send + Sync {
 
     /// Dispatch a slash command (e.g. "new", "clear", "compact", "context")
     /// and return a text result to send back to the channel.
-    async fn dispatch_command(
-        &self,
-        command: &str,
-        reply_to: ChannelReplyTarget,
-    ) -> anyhow::Result<String>;
+    async fn dispatch_command(&self, command: &str, reply_to: ChannelReplyTarget)
+    -> Result<String>;
 
     /// Request disabling a channel account due to a runtime error.
     ///
@@ -370,7 +367,7 @@ mod tests {
             &self,
             _command: &str,
             _reply_to: ChannelReplyTarget,
-        ) -> anyhow::Result<String> {
+        ) -> Result<String> {
             Ok(String::new())
         }
 

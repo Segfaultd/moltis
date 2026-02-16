@@ -37,6 +37,7 @@ export class Session {
 		this.localUnread = signal(false);
 		this.streamText = signal("");
 		this.voicePending = signal(false);
+		this.activeRunId = signal(null);
 		this.lastHistoryIndex = signal(-1);
 		this.sessionTokens = signal({ input: 0, output: 0 });
 		this.contextWindow = signal(0);
@@ -108,6 +109,7 @@ export class Session {
 	resetStreamState() {
 		this.streamText.value = "";
 		this.voicePending.value = false;
+		this.activeRunId.value = null;
 		this.lastToolOutput.value = "";
 	}
 }
@@ -143,12 +145,12 @@ export function setAll(serverSessions) {
 			prev.update(data);
 			// Preserve client-side flags from old patched objects
 			if (data._localUnread) prev.localUnread.value = true;
-			if (data._replying) prev.replying.value = true;
+			if (data._replying || data.replying) prev.replying.value = true;
 			result.push(prev);
 		} else {
 			var session = new Session(data);
 			if (data._localUnread) session.localUnread.value = true;
-			if (data._replying) session.replying.value = true;
+			if (data._replying || data.replying) session.replying.value = true;
 			result.push(session);
 		}
 	}

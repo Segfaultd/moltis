@@ -1,27 +1,34 @@
 use std::{
     collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use secrecy::{ExposeSecret, Secret};
 
 use {
     async_trait::async_trait,
-    serde_json::Value,
-    tokio::sync::RwLock,
+    serde_json::{Map, Value},
+    tokio::sync::{OnceCell, RwLock},
     tracing::{debug, info, warn},
 };
 
 use {
-    moltis_agents::providers::ProviderRegistry,
+    moltis_agents::providers::{ProviderRegistry, raw_model_id},
     moltis_config::schema::ProvidersConfig,
     moltis_oauth::{
         CallbackServer, OAuthFlow, TokenStore, callback_port, device_flow, load_oauth_config,
     },
 };
 
-use crate::services::{ProviderSetupService, ServiceResult};
+use crate::{
+    broadcast::{BroadcastOpts, broadcast},
+    services::{ProviderSetupService, ServiceResult},
+    state::GatewayState,
+};
 
 // ── Key store ──────────────────────────────────────────────────────────────
 
@@ -40,17 +47,19 @@ pub(crate) struct ProviderConfig {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub models: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
 }
 
 fn deserialize_provider_models<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let value: serde_json::Value = serde::Deserialize::deserialize(deserializer)?;
+    let value: Value = serde::Deserialize::deserialize(deserializer)?;
     let normalized = match value {
-        serde_json::Value::Null => Vec::new(),
-        serde_json::Value::String(model) => vec![model],
-        serde_json::Value::Array(values) => values
+        Value::Null => Vec::new(),
+        Value::String(model) => vec![model],
+        Value::Array(values) => values
             .into_iter()
             .filter_map(|value| value.as_str().map(ToString::to_string))
             .collect(),
@@ -71,7 +80,12 @@ fn normalize_model_list(models: impl IntoIterator<Item = String>) -> Vec<String>
         if trimmed.is_empty() {
             continue;
         }
-        let normalized = trimmed.to_string();
+        // Persist raw IDs so provider-local preferences don't collide with
+        // another provider's namespace (e.g. "openai::gpt-5.2").
+        let normalized = raw_model_id(trimmed).trim().to_string();
+        if normalized.is_empty() {
+            continue;
+        }
         if out.iter().any(|existing| existing == &normalized) {
             continue;
         }
@@ -100,6 +114,43 @@ fn parse_models_param(params: &Value) -> Vec<String> {
         models = normalize_model_list([model.to_string()]);
     }
     models
+}
+
+fn progress_payload(value: Value) -> Map<String, Value> {
+    value.as_object().cloned().unwrap_or_default()
+}
+
+struct ProviderSetupTiming {
+    operation: &'static str,
+    provider: String,
+    started: std::time::Instant,
+}
+
+impl ProviderSetupTiming {
+    fn start(operation: &'static str, provider: Option<&str>) -> Self {
+        let provider_name = provider.unwrap_or("<missing>").to_string();
+        info!(
+            operation,
+            provider = %provider_name,
+            "provider setup operation started"
+        );
+        Self {
+            operation,
+            provider: provider_name,
+            started: std::time::Instant::now(),
+        }
+    }
+}
+
+impl Drop for ProviderSetupTiming {
+    fn drop(&mut self) {
+        info!(
+            operation = self.operation,
+            provider = %self.provider,
+            elapsed_ms = self.started.elapsed().as_millis(),
+            "provider setup operation finished"
+        );
+    }
 }
 
 /// File-based provider config storage at `~/.config/moltis/provider_keys.json`.
@@ -168,6 +219,7 @@ impl KeyStore {
                         api_key: Some(v),
                         base_url: None,
                         models: Vec::new(),
+                        display_name: None,
                     })
                 })
                 .collect();
@@ -287,6 +339,18 @@ impl KeyStore {
         base_url: Option<String>,
         models: Option<Vec<String>>,
     ) -> Result<(), String> {
+        self.save_config_with_display_name(provider, api_key, base_url, models, None)
+    }
+
+    /// Save a provider's full configuration, including an optional display name.
+    fn save_config_with_display_name(
+        &self,
+        provider: &str,
+        api_key: Option<String>,
+        base_url: Option<String>,
+        models: Option<Vec<String>>,
+        display_name: Option<String>,
+    ) -> Result<(), String> {
         let guard = self.lock();
         let mut configs = Self::load_all_configs_from_path(&guard.path);
         let entry = configs.entry(provider.to_string()).or_default();
@@ -304,6 +368,9 @@ impl KeyStore {
         }
         if let Some(models) = models {
             entry.models = normalize_model_list(models);
+        }
+        if let Some(name) = display_name {
+            entry.display_name = Some(name);
         }
 
         Self::save_all_configs_to_path(&guard.path, &configs)
@@ -413,6 +480,123 @@ pub(crate) fn config_with_saved_keys(
     }
 
     config
+}
+
+// ── Custom provider helpers ────────────────────────────────────────────────
+
+const CUSTOM_PROVIDER_PREFIX: &str = "custom-";
+
+fn is_custom_provider(name: &str) -> bool {
+    name.starts_with(CUSTOM_PROVIDER_PREFIX)
+}
+
+/// Derive a provider name from a URL, e.g. `https://api.together.ai/v1` → `custom-together-ai`.
+fn derive_provider_name_from_url(raw: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw).ok()?;
+    let host = parsed.host_str()?;
+    let stripped = host.strip_prefix("api.").unwrap_or(host);
+    let slug = stripped.replace('.', "-");
+    Some(format!("{CUSTOM_PROVIDER_PREFIX}{slug}"))
+}
+
+/// Return a unique provider name by appending `-2`, `-3`, etc. if the base
+/// name is already taken.
+fn make_unique_provider_name(base: &str, existing: &HashMap<String, ProviderConfig>) -> String {
+    if !existing.contains_key(base) {
+        return base.to_string();
+    }
+    for i in 2.. {
+        let candidate = format!("{base}-{i}");
+        if !existing.contains_key(&candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+/// Extract a human-friendly display name from a URL.
+/// `https://api.together.ai/v1` → `together.ai`
+fn base_url_to_display_name(raw: &str) -> String {
+    url::Url::parse(raw)
+        .ok()
+        .and_then(|u| u.host_str().map(ToOwned::to_owned))
+        .map(|host| host.strip_prefix("api.").unwrap_or(&host).to_string())
+        .unwrap_or_else(|| raw.to_string())
+}
+
+fn normalize_base_url_for_compare(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    if let Ok(parsed) = url::Url::parse(trimmed) {
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        let mut normalized = format!("{scheme}://{host}");
+        if let Some(port) = parsed.port() {
+            normalized.push(':');
+            normalized.push_str(&port.to_string());
+        }
+        let path = parsed.path().trim_end_matches('/');
+        normalized.push_str(path);
+        return normalized;
+    }
+
+    trimmed.trim_end_matches('/').to_ascii_lowercase()
+}
+
+fn existing_custom_provider_for_base_url(
+    base_url: &str,
+    existing: &HashMap<String, ProviderConfig>,
+) -> Option<String> {
+    let target = normalize_base_url_for_compare(base_url);
+    if target.is_empty() {
+        return None;
+    }
+
+    existing
+        .iter()
+        .filter_map(|(name, cfg)| {
+            if !is_custom_provider(name) {
+                return None;
+            }
+            let existing_url = cfg.base_url.as_deref()?;
+            (normalize_base_url_for_compare(existing_url) == target).then_some(name.clone())
+        })
+        .min_by(|a, b| a.len().cmp(&b.len()).then(a.cmp(b)))
+}
+
+fn validation_provider_name_for_endpoint(
+    provider_name: &str,
+    provider_default_base_url: Option<&str>,
+    base_url: Option<&str>,
+) -> String {
+    if is_custom_provider(provider_name) {
+        return provider_name.to_string();
+    }
+
+    if provider_name != "openai" {
+        return provider_name.to_string();
+    }
+
+    let Some(endpoint) = base_url else {
+        return provider_name.to_string();
+    };
+
+    let normalized_endpoint = normalize_base_url_for_compare(endpoint);
+    if normalized_endpoint.is_empty() {
+        return provider_name.to_string();
+    }
+
+    let normalized_default = normalize_base_url_for_compare(
+        provider_default_base_url.unwrap_or("https://api.openai.com/v1"),
+    );
+    if normalized_default == normalized_endpoint {
+        return provider_name.to_string();
+    }
+
+    derive_provider_name_from_url(endpoint).unwrap_or_else(|| provider_name.to_string())
 }
 
 const OLLAMA_DEFAULT_BASE_URL: &str = "http://localhost:11434";
@@ -588,7 +772,7 @@ fn known_providers() -> Vec<KnownProvider> {
             auth_type: "api-key",
             env_key: Some("OPENROUTER_API_KEY"),
             default_base_url: Some("https://openrouter.ai/api/v1"),
-            requires_model: true,
+            requires_model: false,
             key_optional: false,
         },
         KnownProvider {
@@ -605,7 +789,7 @@ fn known_providers() -> Vec<KnownProvider> {
             display_name: "MiniMax",
             auth_type: "api-key",
             env_key: Some("MINIMAX_API_KEY"),
-            default_base_url: Some("https://api.minimax.chat/v1"),
+            default_base_url: Some("https://api.minimax.io/v1"),
             requires_model: false,
             key_optional: false,
         },
@@ -615,6 +799,15 @@ fn known_providers() -> Vec<KnownProvider> {
             auth_type: "api-key",
             env_key: Some("MOONSHOT_API_KEY"),
             default_base_url: Some("https://api.moonshot.cn/v1"),
+            requires_model: false,
+            key_optional: false,
+        },
+        KnownProvider {
+            name: "zai",
+            display_name: "Z.AI",
+            auth_type: "api-key",
+            env_key: Some("Z_API_KEY"),
+            default_base_url: Some("https://api.z.ai/api/paas/v4"),
             requires_model: false,
             key_optional: false,
         },
@@ -729,7 +922,7 @@ fn codex_cli_auth_has_access_token(path: &Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return false;
     };
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) else {
+    let Ok(json) = serde_json::from_str::<Value>(&raw) else {
         return false;
     };
     json.get("tokens")
@@ -740,7 +933,7 @@ fn codex_cli_auth_has_access_token(path: &Path) -> bool {
 
 /// Parse Codex CLI `auth.json` content into `OAuthTokens`.
 fn parse_codex_cli_tokens(data: &str) -> Option<moltis_oauth::OAuthTokens> {
-    let json: serde_json::Value = serde_json::from_str(data).ok()?;
+    let json: Value = serde_json::from_str(data).ok()?;
     let tokens = json.get("tokens")?;
     let access_token = tokens.get("access_token")?.as_str()?.to_string();
     if access_token.trim().is_empty() {
@@ -803,6 +996,18 @@ fn normalize_provider_name(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+fn env_value_with_overrides(env_overrides: &HashMap<String, String>, key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env_overrides
+                .get(key)
+                .cloned()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
 fn ui_offered_provider_order(config: &ProvidersConfig) -> Vec<String> {
     let mut ordered = Vec::new();
     for name in &config.offered {
@@ -834,9 +1039,10 @@ pub(crate) fn has_explicit_provider_settings(config: &ProvidersConfig) -> bool {
     })
 }
 
-pub(crate) fn detect_auto_provider_sources(
+pub(crate) fn detect_auto_provider_sources_with_overrides(
     config: &ProvidersConfig,
     deploy_platform: Option<&str>,
+    env_overrides: &HashMap<String, String>,
 ) -> Vec<AutoDetectedProviderSource> {
     let is_cloud = deploy_platform.is_some();
     let key_store = KeyStore::new();
@@ -862,9 +1068,7 @@ pub(crate) fn detect_auto_provider_sources(
         let mut sources = Vec::new();
 
         if let Some(env_key) = provider.env_key
-            && std::env::var(env_key)
-                .ok()
-                .is_some_and(|v| !v.trim().is_empty())
+            && env_value_with_overrides(env_overrides, env_key).is_some()
         {
             sources.push(format!("env:{env_key}"));
         }
@@ -946,6 +1150,7 @@ pub(crate) fn detect_auto_provider_sources(
 pub struct LiveProviderSetupService {
     registry: Arc<RwLock<ProviderRegistry>>,
     config: Arc<Mutex<ProvidersConfig>>,
+    state: Arc<OnceCell<Arc<GatewayState>>>,
     token_store: TokenStore,
     key_store: KeyStore,
     pending_oauth: Arc<RwLock<HashMap<String, PendingOAuthFlow>>>,
@@ -955,6 +1160,11 @@ pub struct LiveProviderSetupService {
     /// Shared priority models list from `LiveModelService`. Updated by
     /// `save_model` so the dropdown ordering reflects the latest preference.
     priority_models: Option<Arc<RwLock<Vec<String>>>>,
+    /// Monotonic sequence used to drop stale async registry refreshes.
+    registry_rebuild_seq: Arc<AtomicU64>,
+    /// Static env overrides (for example config `[env]`) used when resolving
+    /// provider credentials without mutating the process environment.
+    env_overrides: HashMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -973,18 +1183,130 @@ impl LiveProviderSetupService {
         Self {
             registry,
             config: Arc::new(Mutex::new(config)),
+            state: Arc::new(OnceCell::new()),
             token_store: TokenStore::new(),
             key_store: KeyStore::new(),
             pending_oauth: Arc::new(RwLock::new(HashMap::new())),
             deploy_platform,
             priority_models: None,
+            registry_rebuild_seq: Arc::new(AtomicU64::new(0)),
+            env_overrides: HashMap::new(),
         }
+    }
+
+    pub fn with_env_overrides(mut self, env_overrides: HashMap<String, String>) -> Self {
+        self.env_overrides = env_overrides;
+        self
     }
 
     /// Wire the shared priority models handle from `LiveModelService` so
     /// `save_model` can update dropdown ordering at runtime.
     pub fn set_priority_models(&mut self, handle: Arc<RwLock<Vec<String>>>) {
         self.priority_models = Some(handle);
+    }
+
+    /// Set the gateway state reference so validation can publish live
+    /// progress events to the UI over WebSocket.
+    pub fn set_state(&self, state: Arc<GatewayState>) {
+        let _ = self.state.set(state);
+    }
+
+    async fn emit_validation_progress(
+        &self,
+        provider: &str,
+        request_id: Option<&str>,
+        phase: &str,
+        mut extra: Map<String, Value>,
+    ) {
+        let Some(state) = self.state.get() else {
+            return;
+        };
+
+        let mut payload = Map::new();
+        payload.insert("provider".to_string(), Value::String(provider.to_string()));
+        payload.insert("phase".to_string(), Value::String(phase.to_string()));
+        if let Some(id) = request_id {
+            payload.insert("requestId".to_string(), Value::String(id.to_string()));
+        }
+        payload.append(&mut extra);
+
+        broadcast(
+            state,
+            "providers.validate.progress",
+            Value::Object(payload),
+            BroadcastOpts::default(),
+        )
+        .await;
+    }
+
+    fn queue_registry_rebuild(&self, provider_name: &str, reason: &'static str) {
+        let rebuild_seq = self.registry_rebuild_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let latest_seq = Arc::clone(&self.registry_rebuild_seq);
+        let registry = Arc::clone(&self.registry);
+        let config = Arc::clone(&self.config);
+        let key_store = self.key_store.clone();
+        let env_overrides = self.env_overrides.clone();
+        let provider_name = provider_name.to_string();
+
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            info!(
+                provider = %provider_name,
+                reason,
+                rebuild_seq,
+                "provider registry async rebuild started"
+            );
+
+            let effective = {
+                let base = config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                config_with_saved_keys(&base, &key_store)
+            };
+
+            let new_registry = match tokio::task::spawn_blocking(move || {
+                ProviderRegistry::from_env_with_config_and_overrides(&effective, &env_overrides)
+            })
+            .await
+            {
+                Ok(registry) => registry,
+                Err(error) => {
+                    warn!(
+                        provider = %provider_name,
+                        reason,
+                        rebuild_seq,
+                        error = %error,
+                        "provider registry async rebuild worker failed"
+                    );
+                    return;
+                },
+            };
+
+            let current_seq = latest_seq.load(Ordering::Acquire);
+            if rebuild_seq != current_seq {
+                info!(
+                    provider = %provider_name,
+                    reason,
+                    rebuild_seq,
+                    latest_seq = current_seq,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "provider registry async rebuild skipped as stale"
+                );
+                return;
+            }
+
+            let provider_summary = new_registry.provider_summary();
+            let model_count = new_registry.list_models().len();
+            let mut reg = registry.write().await;
+            *reg = new_registry;
+            info!(
+                provider = %provider_name,
+                reason,
+                rebuild_seq,
+                provider_summary = %provider_summary,
+                models = model_count,
+                elapsed_ms = started.elapsed().as_millis(),
+                "provider registry async rebuild finished"
+            );
+        });
     }
 
     fn config_snapshot(&self) -> ProvidersConfig {
@@ -1015,7 +1337,7 @@ impl LiveProviderSetupService {
 
         // Check if the provider has an API key set via env
         if let Some(env_key) = provider.env_key
-            && std::env::var(env_key).is_ok()
+            && env_value_with_overrides(&self.env_overrides, env_key).is_some()
         {
             return true;
         }
@@ -1114,6 +1436,7 @@ impl LiveProviderSetupService {
         let token_store = self.token_store.clone();
         let registry = Arc::clone(&self.registry);
         let config = self.effective_config();
+        let env_overrides = self.env_overrides.clone();
         let poll_headers = extra_headers.clone();
         tokio::spawn(async move {
             let poll_extra = poll_headers.as_ref();
@@ -1135,7 +1458,10 @@ impl LiveProviderSetupService {
                         );
                         return;
                     }
-                    let new_registry = ProviderRegistry::from_env_with_config(&config);
+                    let new_registry = ProviderRegistry::from_env_with_config_and_overrides(
+                        &config,
+                        &env_overrides,
+                    );
                     let provider_summary = new_registry.provider_summary();
                     let model_count = new_registry.list_models().len();
                     let mut reg = registry.write().await;
@@ -1169,6 +1495,10 @@ impl LiveProviderSetupService {
     fn effective_config(&self) -> ProvidersConfig {
         let base = self.config_snapshot();
         config_with_saved_keys(&base, &self.key_store)
+    }
+
+    fn build_registry(&self, config: &ProvidersConfig) -> ProviderRegistry {
+        ProviderRegistry::from_env_with_config_and_overrides(config, &self.env_overrides)
     }
 
     fn has_oauth_tokens(&self, provider_name: &str) -> bool {
@@ -1282,6 +1612,39 @@ impl ProviderSetupService for LiveProviderSetupService {
             })
             .collect();
 
+        // Append custom providers from the key store.
+        let known_count = providers.len();
+        for (name, config) in self.key_store.load_all_configs() {
+            if !is_custom_provider(&name) {
+                continue;
+            }
+            if active_config.get(&name).is_some_and(|entry| !entry.enabled) {
+                continue;
+            }
+            let display_name = config.display_name.clone().unwrap_or_else(|| name.clone());
+            let base_url = config.base_url.clone();
+            let models = normalize_model_list(config.models.clone());
+            let model = models.first().cloned();
+
+            providers.push((
+                None,
+                known_count, // sort after all known providers
+                serde_json::json!({
+                    "name": name,
+                    "displayName": display_name,
+                    "authType": "api-key",
+                    "configured": true,
+                    "defaultBaseUrl": base_url,
+                    "baseUrl": base_url,
+                    "models": models,
+                    "model": model,
+                    "requiresModel": true,
+                    "keyOptional": false,
+                    "isCustom": true,
+                }),
+            ));
+        }
+
         providers.sort_by(
             |(a_offered, a_known, a_value), (b_offered, b_known, b_value)| {
                 let offered_cmp = match (a_offered, b_offered) {
@@ -1326,6 +1689,10 @@ impl ProviderSetupService for LiveProviderSetupService {
     }
 
     async fn save_key(&self, params: Value) -> ServiceResult {
+        let _timing = ProviderSetupTiming::start(
+            "providers.save_key",
+            params.get("provider").and_then(Value::as_str),
+        );
         let provider_name = params
             .get("provider")
             .and_then(|v| v.as_str())
@@ -1336,17 +1703,23 @@ impl ProviderSetupService for LiveProviderSetupService {
         let base_url = params.get("baseUrl").and_then(|v| v.as_str());
         let models = parse_models_param(&params);
 
-        // Validate provider name - allow both api-key and local providers
-        let known = known_providers();
-        let provider = known
-            .iter()
-            .find(|p| {
-                p.name == provider_name && (p.auth_type == "api-key" || p.auth_type == "local")
-            })
-            .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
+        // Custom providers bypass known_providers() validation.
+        let is_custom = is_custom_provider(provider_name);
+        if !is_custom {
+            // Validate provider name - allow both api-key and local providers
+            let known = known_providers();
+            let provider = known
+                .iter()
+                .find(|p| {
+                    p.name == provider_name && (p.auth_type == "api-key" || p.auth_type == "local")
+                })
+                .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
 
-        // API key is required for api-key providers (except Ollama which is optional)
-        if provider.auth_type == "api-key" && provider_name != "ollama" && api_key.is_none() {
+            // API key is required for api-key providers (except Ollama which is optional)
+            if provider.auth_type == "api-key" && provider_name != "ollama" && api_key.is_none() {
+                return Err("missing 'apiKey' parameter".to_string());
+            }
+        } else if api_key.is_none() {
             return Err("missing 'apiKey' parameter".to_string());
         }
 
@@ -1390,7 +1763,7 @@ impl ProviderSetupService for LiveProviderSetupService {
 
         // Rebuild the provider registry with saved keys merged into config.
         let effective = self.effective_config();
-        let new_registry = ProviderRegistry::from_env_with_config(&effective);
+        let new_registry = self.build_registry(&effective);
         let provider_summary = new_registry.provider_summary();
         let model_count = new_registry.list_models().len();
         let mut reg = self.registry.write().await;
@@ -1431,7 +1804,7 @@ impl ProviderSetupService for LiveProviderSetupService {
         // skip launching a fresh OAuth flow and rebuild the registry immediately.
         if self.has_oauth_tokens(&provider_name) {
             let effective = self.effective_config();
-            let new_registry = ProviderRegistry::from_env_with_config(&effective);
+            let new_registry = self.build_registry(&effective);
             let provider_summary = new_registry.provider_summary();
             let model_count = new_registry.list_models().len();
             let mut reg = self.registry.write().await;
@@ -1488,6 +1861,7 @@ impl ProviderSetupService for LiveProviderSetupService {
         let token_store = self.token_store.clone();
         let registry = Arc::clone(&self.registry);
         let config = self.effective_config();
+        let env_overrides = self.env_overrides.clone();
         tokio::spawn(async move {
             match CallbackServer::wait_for_code(port, expected_state).await {
                 Ok(code) => {
@@ -1502,7 +1876,10 @@ impl ProviderSetupService for LiveProviderSetupService {
                                 return;
                             }
                             // Rebuild registry with new tokens
-                            let new_registry = ProviderRegistry::from_env_with_config(&config);
+                            let new_registry = ProviderRegistry::from_env_with_config_and_overrides(
+                                &config,
+                                &env_overrides,
+                            );
                             let provider_summary = new_registry.provider_summary();
                             let model_count = new_registry.list_models().len();
                             let mut reg = registry.write().await;
@@ -1570,7 +1947,7 @@ impl ProviderSetupService for LiveProviderSetupService {
         self.set_provider_enabled_in_memory(&pending.provider_name, true);
 
         let effective = self.effective_config();
-        let new_registry = ProviderRegistry::from_env_with_config(&effective);
+        let new_registry = self.build_registry(&effective);
         let provider_summary = new_registry.provider_summary();
         let model_count = new_registry.list_models().len();
         let mut reg = self.registry.write().await;
@@ -1595,40 +1972,47 @@ impl ProviderSetupService for LiveProviderSetupService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'provider' parameter".to_string())?;
 
-        let providers = known_providers();
-        let known = providers
-            .iter()
-            .find(|p| p.name == provider_name)
-            .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
-
-        // Remove persisted API key
-        if known.auth_type == "api-key" {
+        if is_custom_provider(provider_name) {
+            // Custom provider: remove key store entry + disable.
             self.key_store.remove(provider_name)?;
-        }
+            set_provider_enabled_in_config(provider_name, false)?;
+            self.set_provider_enabled_in_memory(provider_name, false);
+        } else {
+            let providers = known_providers();
+            let known = providers
+                .iter()
+                .find(|p| p.name == provider_name)
+                .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
 
-        // Remove OAuth tokens
-        if known.auth_type == "oauth" || provider_name == "kimi-code" {
-            let _ = self.token_store.delete(provider_name);
-        }
+            // Remove persisted API key
+            if known.auth_type == "api-key" {
+                self.key_store.remove(provider_name)?;
+            }
 
-        // Persist explicit disable so auto-detected/global credentials do not
-        // immediately re-enable the provider on next rebuild.
-        set_provider_enabled_in_config(provider_name, false)?;
-        self.set_provider_enabled_in_memory(provider_name, false);
+            // Remove OAuth tokens
+            if known.auth_type == "oauth" || provider_name == "kimi-code" {
+                let _ = self.token_store.delete(provider_name);
+            }
 
-        // Remove local-llm config
-        #[cfg(feature = "local-llm")]
-        if known.auth_type == "local"
-            && provider_name == "local-llm"
-            && let Some(config_dir) = moltis_config::config_dir()
-        {
-            let config_path = config_dir.join("local-llm.json");
-            let _ = std::fs::remove_file(config_path);
+            // Persist explicit disable so auto-detected/global credentials do not
+            // immediately re-enable the provider on next rebuild.
+            set_provider_enabled_in_config(provider_name, false)?;
+            self.set_provider_enabled_in_memory(provider_name, false);
+
+            // Remove local-llm config
+            #[cfg(feature = "local-llm")]
+            if known.auth_type == "local"
+                && provider_name == "local-llm"
+                && let Some(config_dir) = moltis_config::config_dir()
+            {
+                let config_path = config_dir.join("local-llm.json");
+                let _ = std::fs::remove_file(config_path);
+            }
         }
 
         // Rebuild the provider registry without the removed provider.
         let effective = self.effective_config();
-        let new_registry = ProviderRegistry::from_env_with_config(&effective);
+        let new_registry = self.build_registry(&effective);
         let mut reg = self.registry.write().await;
         *reg = new_registry;
 
@@ -1664,30 +2048,82 @@ impl ProviderSetupService for LiveProviderSetupService {
         let api_key = params.get("apiKey").and_then(|v| v.as_str());
         let base_url = params.get("baseUrl").and_then(|v| v.as_str());
         let preferred_models = parse_models_param(&params);
+        let request_id = params
+            .get("requestId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToString::to_string);
 
-        // Validate provider name exists.
-        let known = known_providers();
-        let provider_info = known
-            .iter()
-            .find(|p| p.name == provider_name)
-            .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
+        // Custom providers bypass known_providers() validation.
+        let is_custom = is_custom_provider(provider_name);
+        let provider_info = if is_custom {
+            None
+        } else {
+            let known = known_providers();
+            let info = known
+                .iter()
+                .find(|p| p.name == provider_name)
+                .ok_or_else(|| format!("unknown provider: {provider_name}"))?;
+            // API key is required for api-key providers (except Ollama).
+            if info.auth_type == "api-key" && provider_name != "ollama" && api_key.is_none() {
+                return Err("missing 'apiKey' parameter".to_string());
+            }
+            Some(KnownProvider {
+                name: info.name,
+                display_name: info.display_name,
+                auth_type: info.auth_type,
+                env_key: info.env_key,
+                default_base_url: info.default_base_url,
+                requires_model: info.requires_model,
+                key_optional: info.key_optional,
+            })
+        };
 
-        // API key is required for api-key providers (except Ollama).
-        if provider_info.auth_type == "api-key" && provider_name != "ollama" && api_key.is_none() {
+        if is_custom && api_key.is_none() {
             return Err("missing 'apiKey' parameter".to_string());
+        }
+        if is_custom && base_url.filter(|s| !s.trim().is_empty()).is_none() {
+            return Err("missing 'baseUrl' parameter".to_string());
         }
 
         let selected_model = preferred_models.first().map(String::as_str);
         let base_url_value = base_url.filter(|s| !s.trim().is_empty());
+        let validation_provider_name = validation_provider_name_for_endpoint(
+            provider_name,
+            provider_info.as_ref().and_then(|p| p.default_base_url),
+            base_url_value,
+        );
+        let _timing =
+            ProviderSetupTiming::start("providers.validate_key", Some(&validation_provider_name));
+        self.emit_validation_progress(
+            &validation_provider_name,
+            request_id.as_deref(),
+            "start",
+            progress_payload(serde_json::json!({
+                "message": "Starting provider validation.",
+            })),
+        )
+        .await;
 
         // Ollama supports native model discovery through /api/tags.
         // If no model is supplied, return discovered models for UI selection.
         if provider_name == "ollama" {
-            let ollama_api_base =
-                normalize_ollama_api_base_url(base_url_value.or(provider_info.default_base_url));
+            let ollama_api_base = normalize_ollama_api_base_url(
+                base_url_value.or(provider_info.as_ref().and_then(|p| p.default_base_url)),
+            );
             let discovered_models = match discover_ollama_models(&ollama_api_base).await {
                 Ok(models) => models,
                 Err(error) => {
+                    self.emit_validation_progress(
+                        &validation_provider_name,
+                        request_id.as_deref(),
+                        "error",
+                        progress_payload(serde_json::json!({
+                            "message": error.clone(),
+                        })),
+                    )
+                    .await;
                     return Ok(serde_json::json!({
                         "valid": false,
                         "error": error,
@@ -1696,9 +2132,19 @@ impl ProviderSetupService for LiveProviderSetupService {
             };
 
             if discovered_models.is_empty() {
+                let error = "No Ollama models found. Install one first with `ollama pull <model>`.";
+                self.emit_validation_progress(
+                    &validation_provider_name,
+                    request_id.as_deref(),
+                    "error",
+                    progress_payload(serde_json::json!({
+                        "message": error,
+                    })),
+                )
+                .await;
                 return Ok(serde_json::json!({
                     "valid": false,
-                    "error": "No Ollama models found. Install one first with `ollama pull <model>`.",
+                    "error": error,
                 }));
             }
 
@@ -1708,14 +2154,34 @@ impl ProviderSetupService for LiveProviderSetupService {
                     .iter()
                     .any(|installed_model| ollama_model_matches(installed_model, requested_model));
                 if !installed {
+                    let error = format!(
+                        "Model '{requested_model}' is not installed in Ollama. Install it with `ollama pull {requested_model}`."
+                    );
+                    self.emit_validation_progress(
+                        &validation_provider_name,
+                        request_id.as_deref(),
+                        "error",
+                        progress_payload(serde_json::json!({
+                            "message": error.clone(),
+                        })),
+                    )
+                    .await;
                     return Ok(serde_json::json!({
                         "valid": false,
-                        "error": format!(
-                            "Model '{requested_model}' is not installed in Ollama. Install it with `ollama pull {requested_model}`."
-                        ),
+                        "error": error,
                     }));
                 }
             } else {
+                self.emit_validation_progress(
+                    &validation_provider_name,
+                    request_id.as_deref(),
+                    "complete",
+                    progress_payload(serde_json::json!({
+                        "message": "Discovered installed Ollama models.",
+                        "modelCount": discovered_models.len(),
+                    })),
+                )
+                .await;
                 return Ok(serde_json::json!({
                     "valid": true,
                     "models": ollama_models_payload(&discovered_models),
@@ -1732,7 +2198,7 @@ impl ProviderSetupService for LiveProviderSetupService {
         // Build a temporary ProvidersConfig with just this provider.
         let mut temp_config = ProvidersConfig::default();
         temp_config.providers.insert(
-            provider_name.to_string(),
+            validation_provider_name.clone(),
             moltis_config::schema::ProviderEntry {
                 enabled: true,
                 api_key: api_key.map(|k| Secret::new(k.to_string())),
@@ -1743,54 +2209,134 @@ impl ProviderSetupService for LiveProviderSetupService {
         );
 
         // Build a temporary registry from the temp config.
-        let temp_registry = ProviderRegistry::from_env_with_config(&temp_config);
+        let temp_registry = self.build_registry(&temp_config);
 
         // Filter models for this provider.
         let models: Vec<_> = temp_registry
             .list_models()
             .iter()
             .filter(|m| {
-                normalize_provider_name(&m.provider) == normalize_provider_name(provider_name)
+                normalize_provider_name(&m.provider)
+                    == normalize_provider_name(&validation_provider_name)
             })
             .cloned()
             .collect();
 
         if models.is_empty() {
+            let error =
+                "No models available for this provider. Check your credentials and try again.";
+            self.emit_validation_progress(
+                &validation_provider_name,
+                request_id.as_deref(),
+                "error",
+                progress_payload(serde_json::json!({
+                    "message": error,
+                })),
+            )
+            .await;
             return Ok(serde_json::json!({
                 "valid": false,
-                "error": "No models available for this provider. Check your credentials and try again.",
+                "error": error,
             }));
         }
+
+        info!(
+            provider = %validation_provider_name,
+            model_count = models.len(),
+            "provider validation discovered candidate models for probing"
+        );
+        self.emit_validation_progress(
+            &validation_provider_name,
+            request_id.as_deref(),
+            "candidates_discovered",
+            progress_payload(serde_json::json!({
+                "modelCount": models.len(),
+                "message": format!("Discovered {} candidate models.", models.len()),
+            })),
+        )
+        .await;
+
+        const VALIDATION_MAX_MODEL_PROBES: usize = 8;
+        const VALIDATION_MAX_TIMEOUTS: usize = 2;
+        const VALIDATION_PROBE_TIMEOUT_SECS: u64 = 10;
+        let total_probe_attempts = models.len().min(VALIDATION_MAX_MODEL_PROBES);
 
         let probe = [ChatMessage::user("ping")];
         let mut probe_attempted = false;
         let mut unsupported_errors = Vec::new();
         let mut last_error: Option<String> = None;
         let mut probe_succeeded = false;
+        let mut timeout_count = 0usize;
 
         // Try multiple models because provider catalogs can include endpoint-
         // incompatible IDs. We only need one successful probe to validate creds.
-        for probe_model in &models {
+        for (attempt, probe_model) in models.iter().take(VALIDATION_MAX_MODEL_PROBES).enumerate() {
             let Some(llm_provider) = temp_registry.get(&probe_model.id) else {
                 continue;
             };
 
             probe_attempted = true;
+            let probe_started = std::time::Instant::now();
+            info!(
+                provider = %validation_provider_name,
+                model = %probe_model.id,
+                attempt = attempt + 1,
+                total_models = models.len(),
+                "provider validation model probe started"
+            );
+            self.emit_validation_progress(
+                &validation_provider_name,
+                request_id.as_deref(),
+                "probe_started",
+                progress_payload(serde_json::json!({
+                    "modelId": probe_model.id,
+                    "attempt": attempt + 1,
+                    "totalAttempts": total_probe_attempts,
+                    "message": format!(
+                        "Probing model {} of {}.",
+                        attempt + 1,
+                        total_probe_attempts
+                    ),
+                })),
+            )
+            .await;
             let result = tokio::time::timeout(
-                std::time::Duration::from_secs(20),
+                std::time::Duration::from_secs(VALIDATION_PROBE_TIMEOUT_SECS),
                 llm_provider.complete(&probe, &[]),
             )
             .await;
 
             match result {
                 Ok(Ok(_)) => {
+                    let elapsed_ms = probe_started.elapsed().as_millis();
+                    info!(
+                        provider = %validation_provider_name,
+                        model = %probe_model.id,
+                        elapsed_ms,
+                        "provider validation model probe succeeded"
+                    );
+                    self.emit_validation_progress(
+                        &validation_provider_name,
+                        request_id.as_deref(),
+                        "probe_succeeded",
+                        progress_payload(serde_json::json!({
+                            "modelId": probe_model.id,
+                            "elapsedMs": elapsed_ms,
+                            "attempt": attempt + 1,
+                            "totalAttempts": total_probe_attempts,
+                            "message": "Model probe succeeded.",
+                        })),
+                    )
+                    .await;
                     probe_succeeded = true;
                     break;
                 },
                 Ok(Err(err)) => {
                     let error_text = err.to_string();
-                    let error_obj =
-                        crate::chat_error::parse_chat_error(&error_text, Some(provider_name));
+                    let error_obj = crate::chat_error::parse_chat_error(
+                        &error_text,
+                        Some(&validation_provider_name),
+                    );
                     let detail = error_obj
                         .get("detail")
                         .and_then(|v| v.as_str())
@@ -1798,6 +2344,28 @@ impl ProviderSetupService for LiveProviderSetupService {
                         .to_string();
                     let is_unsupported =
                         error_obj.get("type").and_then(|v| v.as_str()) == Some("unsupported_model");
+                    let elapsed_ms = probe_started.elapsed().as_millis();
+                    info!(
+                        provider = %validation_provider_name,
+                        model = %probe_model.id,
+                        elapsed_ms,
+                        unsupported = is_unsupported,
+                        "provider validation model probe failed"
+                    );
+                    self.emit_validation_progress(
+                        &validation_provider_name,
+                        request_id.as_deref(),
+                        "probe_failed",
+                        progress_payload(serde_json::json!({
+                            "modelId": probe_model.id,
+                            "elapsedMs": elapsed_ms,
+                            "attempt": attempt + 1,
+                            "totalAttempts": total_probe_attempts,
+                            "unsupported": is_unsupported,
+                            "message": detail.clone(),
+                        })),
+                    )
+                    .await;
                     if is_unsupported {
                         unsupported_errors.push(detail);
                         continue;
@@ -1806,18 +2374,47 @@ impl ProviderSetupService for LiveProviderSetupService {
                     break;
                 },
                 Err(_) => {
-                    last_error = Some(
-                        "Connection timed out after 20 seconds. Check your endpoint URL and try again."
-                            .to_string(),
+                    timeout_count += 1;
+                    let elapsed_ms = probe_started.elapsed().as_millis();
+                    warn!(
+                        provider = %validation_provider_name,
+                        model = %probe_model.id,
+                        timeout_count,
+                        max_timeouts = VALIDATION_MAX_TIMEOUTS,
+                        elapsed_ms,
+                        "provider validation model probe timed out"
                     );
-                    break;
+                    self.emit_validation_progress(
+                        &validation_provider_name,
+                        request_id.as_deref(),
+                        "probe_timeout",
+                        progress_payload(serde_json::json!({
+                            "modelId": probe_model.id,
+                            "elapsedMs": elapsed_ms,
+                            "attempt": attempt + 1,
+                            "totalAttempts": total_probe_attempts,
+                            "timeoutCount": timeout_count,
+                            "maxTimeouts": VALIDATION_MAX_TIMEOUTS,
+                            "message": format!(
+                                "Timed out probing model after {VALIDATION_PROBE_TIMEOUT_SECS} seconds."
+                            ),
+                        })),
+                    )
+                    .await;
+                    if timeout_count >= VALIDATION_MAX_TIMEOUTS {
+                        last_error = Some(format!(
+                            "Connection timed out after {VALIDATION_PROBE_TIMEOUT_SECS} seconds while validating models. Check your endpoint URL and try again."
+                        ));
+                        break;
+                    }
+                    continue;
                 },
             }
         }
 
         if probe_succeeded {
             // Build model list for the frontend, excluding non-chat models.
-            let model_list: Vec<serde_json::Value> = models
+            let model_list: Vec<Value> = models
                 .iter()
                 .filter(|m| moltis_agents::providers::is_chat_capable_model(&m.id))
                 .map(|m| {
@@ -1832,6 +2429,16 @@ impl ProviderSetupService for LiveProviderSetupService {
                 })
                 .collect();
 
+            self.emit_validation_progress(
+                &validation_provider_name,
+                request_id.as_deref(),
+                "complete",
+                progress_payload(serde_json::json!({
+                    "message": "Validation complete.",
+                    "modelCount": model_list.len(),
+                })),
+            )
+            .await;
             return Ok(serde_json::json!({
                 "valid": true,
                 "models": model_list,
@@ -1839,13 +2446,32 @@ impl ProviderSetupService for LiveProviderSetupService {
         }
 
         if !probe_attempted {
+            let error = "Could not instantiate provider for probing.";
+            self.emit_validation_progress(
+                &validation_provider_name,
+                request_id.as_deref(),
+                "error",
+                progress_payload(serde_json::json!({
+                    "message": error,
+                })),
+            )
+            .await;
             return Ok(serde_json::json!({
                 "valid": false,
-                "error": "Could not instantiate provider for probing.",
+                "error": error,
             }));
         }
 
         if let Some(error) = last_error {
+            self.emit_validation_progress(
+                &validation_provider_name,
+                request_id.as_deref(),
+                "error",
+                progress_payload(serde_json::json!({
+                    "message": error,
+                })),
+            )
+            .await;
             return Ok(serde_json::json!({
                 "valid": false,
                 "error": error,
@@ -1855,6 +2481,15 @@ impl ProviderSetupService for LiveProviderSetupService {
         let unsupported_error = unsupported_errors.into_iter().next().unwrap_or_else(|| {
             "No supported chat models were found for this provider.".to_string()
         });
+        self.emit_validation_progress(
+            &validation_provider_name,
+            request_id.as_deref(),
+            "error",
+            progress_payload(serde_json::json!({
+                "message": unsupported_error.clone(),
+            })),
+        )
+        .await;
         Ok(serde_json::json!({
             "valid": false,
             "error": unsupported_error,
@@ -1872,10 +2507,12 @@ impl ProviderSetupService for LiveProviderSetupService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "missing 'model' parameter".to_string())?;
 
-        // Validate provider exists.
-        let known = known_providers();
-        if !known.iter().any(|p| p.name == provider_name) {
-            return Err(format!("unknown provider: {provider_name}"));
+        // Validate provider exists (known or custom).
+        if !is_custom_provider(provider_name) {
+            let known = known_providers();
+            if !known.iter().any(|p| p.name == provider_name) {
+                return Err(format!("unknown provider: {provider_name}"));
+            }
         }
 
         // Prepend chosen model to existing saved models so it appears first,
@@ -1887,13 +2524,6 @@ impl ProviderSetupService for LiveProviderSetupService {
 
         self.key_store
             .save_config(provider_name, None, None, Some(models))?;
-
-        // Rebuild the provider registry so the new model ordering takes
-        // effect immediately (models.list reflects updated preferences).
-        let effective = self.effective_config();
-        let new_registry = ProviderRegistry::from_env_with_config(&effective);
-        let mut reg = self.registry.write().await;
-        *reg = new_registry;
 
         // Update the cross-provider priority list so the dropdown puts
         // the chosen model at the top immediately.
@@ -1907,12 +2537,17 @@ impl ProviderSetupService for LiveProviderSetupService {
 
         info!(
             provider = provider_name,
-            model, "saved model preference and rebuilt registry"
+            model, "saved model preference and queued async registry rebuild"
         );
+        self.queue_registry_rebuild(provider_name, "save_model");
         Ok(serde_json::json!({ "ok": true }))
     }
 
     async fn save_models(&self, params: Value) -> ServiceResult {
+        let _timing = ProviderSetupTiming::start(
+            "providers.save_models",
+            params.get("provider").and_then(Value::as_str),
+        );
         let provider_name = params
             .get("provider")
             .and_then(|v| v.as_str())
@@ -1926,21 +2561,16 @@ impl ProviderSetupService for LiveProviderSetupService {
             .filter_map(|v| v.as_str().map(String::from))
             .collect();
 
-        // Validate provider exists.
-        let known = known_providers();
-        if !known.iter().any(|p| p.name == provider_name) {
-            return Err(format!("unknown provider: {provider_name}"));
+        // Validate provider exists (known or custom).
+        if !is_custom_provider(provider_name) {
+            let known = known_providers();
+            if !known.iter().any(|p| p.name == provider_name) {
+                return Err(format!("unknown provider: {provider_name}"));
+            }
         }
 
         self.key_store
             .save_config(provider_name, None, None, Some(models.clone()))?;
-
-        // Rebuild the provider registry so the new model ordering takes
-        // effect immediately.
-        let effective = self.effective_config();
-        let new_registry = ProviderRegistry::from_env_with_config(&effective);
-        let mut reg = self.registry.write().await;
-        *reg = new_registry;
 
         // Update the cross-provider priority list.
         if let Some(ref priority) = self.priority_models {
@@ -1957,9 +2587,77 @@ impl ProviderSetupService for LiveProviderSetupService {
             provider = provider_name,
             count = models.len(),
             models = ?models,
-            "saved model preferences and rebuilt registry"
+            "saved model preferences and queued async registry rebuild"
         );
+        self.queue_registry_rebuild(provider_name, "save_models");
         Ok(serde_json::json!({ "ok": true }))
+    }
+
+    async fn add_custom(&self, params: Value) -> ServiceResult {
+        let _timing = ProviderSetupTiming::start("providers.add_custom", None);
+
+        let base_url = params
+            .get("baseUrl")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "missing 'baseUrl' parameter".to_string())?;
+
+        let api_key = params
+            .get("apiKey")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "missing 'apiKey' parameter".to_string())?;
+
+        let model = params
+            .get("model")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty());
+
+        let base_name = derive_provider_name_from_url(base_url)
+            .ok_or_else(|| "could not parse endpoint URL".to_string())?;
+
+        let existing = self.key_store.load_all_configs();
+        let provider_name = existing_custom_provider_for_base_url(base_url, &existing)
+            .unwrap_or_else(|| make_unique_provider_name(&base_name, &existing));
+        let reused_existing_provider = existing.contains_key(&provider_name);
+        let display_name = base_url_to_display_name(base_url);
+
+        let models = model.map(|m| vec![m.to_string()]);
+
+        self.key_store.save_config_with_display_name(
+            &provider_name,
+            Some(api_key.to_string()),
+            Some(base_url.to_string()),
+            models,
+            Some(display_name.clone()),
+        )?;
+
+        set_provider_enabled_in_config(&provider_name, true)?;
+        self.set_provider_enabled_in_memory(&provider_name, true);
+
+        // Rebuild synchronously so the just-added custom provider is immediately
+        // available for model probing in the same UI flow.
+        let effective = self.effective_config();
+        let new_registry = self.build_registry(&effective);
+        let provider_summary = new_registry.provider_summary();
+        let model_count = new_registry.list_models().len();
+        let mut reg = self.registry.write().await;
+        *reg = new_registry;
+
+        info!(
+            provider = %provider_name,
+            display_name = %display_name,
+            reused = reused_existing_provider,
+            provider_summary = %provider_summary,
+            models = model_count,
+            "saved custom OpenAI-compatible provider and rebuilt provider registry"
+        );
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "providerName": provider_name,
+            "displayName": display_name,
+        }))
     }
 }
 
@@ -2578,6 +3276,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn available_includes_configured_custom_provider_outside_offered() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let key_store = KeyStore::with_path(dir.path().join("provider_keys.json"));
+        key_store
+            .save_config_with_display_name(
+                "custom-openrouter-ai",
+                Some("sk-test".into()),
+                Some("https://openrouter.ai/api/v1".into()),
+                Some(vec!["openai::gpt-5.2".into()]),
+                Some("openrouter.ai".into()),
+            )
+            .expect("save custom provider");
+
+        let mut config = ProvidersConfig {
+            offered: vec!["openai".into()],
+            ..ProvidersConfig::default()
+        };
+        config
+            .providers
+            .insert("custom-openrouter-ai".into(), ProviderEntry {
+                enabled: true,
+                ..Default::default()
+            });
+
+        let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
+            &ProvidersConfig::default(),
+        )));
+        let svc = LiveProviderSetupService {
+            registry,
+            config: Arc::new(Mutex::new(config)),
+            state: Arc::new(OnceCell::new()),
+            token_store: TokenStore::new(),
+            key_store,
+            pending_oauth: Arc::new(RwLock::new(HashMap::new())),
+            deploy_platform: None,
+            priority_models: None,
+            registry_rebuild_seq: Arc::new(AtomicU64::new(0)),
+            env_overrides: HashMap::new(),
+        };
+
+        let result = svc.available().await.expect("providers.available");
+        let arr = result
+            .as_array()
+            .expect("providers.available should return array");
+        let custom = arr
+            .iter()
+            .find(|v| v.get("name").and_then(|n| n.as_str()) == Some("custom-openrouter-ai"))
+            .expect("custom provider should be visible");
+
+        assert_eq!(
+            custom.get("configured").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert_eq!(custom.get("isCustom").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            custom.get("displayName").and_then(|v| v.as_str()),
+            Some("openrouter.ai")
+        );
+    }
+
+    #[tokio::test]
     async fn available_includes_default_base_urls() {
         let registry = Arc::new(RwLock::new(ProviderRegistry::from_env_with_config(
             &ProvidersConfig::default(),
@@ -2743,6 +3502,7 @@ mod tests {
         assert!(names.contains(&"cerebras"), "missing cerebras");
         assert!(names.contains(&"minimax"), "missing minimax");
         assert!(names.contains(&"moonshot"), "missing moonshot");
+        assert!(names.contains(&"zai"), "missing zai");
         assert!(names.contains(&"kimi-code"), "missing kimi-code");
         assert!(names.contains(&"venice"), "missing venice");
         assert!(names.contains(&"ollama"), "missing ollama");
@@ -2769,6 +3529,7 @@ mod tests {
             ("cerebras", "CEREBRAS_API_KEY"),
             ("minimax", "MINIMAX_API_KEY"),
             ("moonshot", "MOONSHOT_API_KEY"),
+            ("zai", "Z_API_KEY"),
             ("kimi-code", "KIMI_API_KEY"),
             ("venice", "VENICE_API_KEY"),
             ("ollama", "OLLAMA_API_KEY"),
@@ -2799,6 +3560,7 @@ mod tests {
             "cerebras",
             "minimax",
             "moonshot",
+            "zai",
             "kimi-code",
             "venice",
             "ollama",
@@ -2835,6 +3597,7 @@ mod tests {
             "cerebras",
             "minimax",
             "moonshot",
+            "zai",
             "kimi-code",
             "venice",
             "ollama",
@@ -3159,5 +3922,184 @@ mod tests {
 
         std::fs::write(&path, r#"{"not_tokens":true}"#).unwrap();
         assert!(!codex_cli_auth_has_access_token(&path));
+    }
+
+    #[test]
+    fn is_custom_provider_detects_prefix() {
+        assert!(is_custom_provider("custom-together-ai"));
+        assert!(is_custom_provider("custom-openrouter-ai"));
+        assert!(!is_custom_provider("openai"));
+        assert!(!is_custom_provider("anthropic"));
+    }
+
+    #[test]
+    fn derive_provider_name_from_url_extracts_host() {
+        assert_eq!(
+            derive_provider_name_from_url("https://api.together.ai/v1"),
+            Some("custom-together-ai".into())
+        );
+        assert_eq!(
+            derive_provider_name_from_url("https://openrouter.ai/api/v1"),
+            Some("custom-openrouter-ai".into())
+        );
+        assert_eq!(
+            derive_provider_name_from_url("https://api.example.com"),
+            Some("custom-example-com".into())
+        );
+        assert_eq!(derive_provider_name_from_url("not-a-url"), None);
+    }
+
+    #[test]
+    fn make_unique_provider_name_appends_suffix() {
+        let mut existing = HashMap::new();
+        assert_eq!(
+            make_unique_provider_name("custom-foo", &existing),
+            "custom-foo"
+        );
+
+        existing.insert("custom-foo".into(), ProviderConfig::default());
+        assert_eq!(
+            make_unique_provider_name("custom-foo", &existing),
+            "custom-foo-2"
+        );
+
+        existing.insert("custom-foo-2".into(), ProviderConfig::default());
+        assert_eq!(
+            make_unique_provider_name("custom-foo", &existing),
+            "custom-foo-3"
+        );
+    }
+
+    #[test]
+    fn base_url_to_display_name_strips_api_prefix() {
+        assert_eq!(
+            base_url_to_display_name("https://api.together.ai/v1"),
+            "together.ai"
+        );
+        assert_eq!(
+            base_url_to_display_name("https://openrouter.ai/api/v1"),
+            "openrouter.ai"
+        );
+    }
+
+    #[test]
+    fn validation_provider_name_for_endpoint_keeps_openai_for_default_url() {
+        assert_eq!(
+            validation_provider_name_for_endpoint(
+                "openai",
+                Some("https://api.openai.com/v1"),
+                Some("https://api.openai.com/v1/"),
+            ),
+            "openai"
+        );
+    }
+
+    #[test]
+    fn validation_provider_name_for_endpoint_maps_openai_override_to_custom() {
+        assert_eq!(
+            validation_provider_name_for_endpoint(
+                "openai",
+                Some("https://api.openai.com/v1"),
+                Some("https://openrouter.ai/api/v1"),
+            ),
+            "custom-openrouter-ai"
+        );
+    }
+
+    #[test]
+    fn validation_provider_name_for_endpoint_preserves_explicit_custom_provider() {
+        assert_eq!(
+            validation_provider_name_for_endpoint(
+                "custom-openrouter-ai",
+                Some("https://api.openai.com/v1"),
+                Some("https://openrouter.ai/api/v1"),
+            ),
+            "custom-openrouter-ai"
+        );
+    }
+
+    #[test]
+    fn normalize_base_url_for_compare_is_stable() {
+        assert_eq!(
+            normalize_base_url_for_compare("https://OPENROUTER.ai/api/v1/"),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            normalize_base_url_for_compare(" https://openrouter.ai/api/v1 "),
+            "https://openrouter.ai/api/v1"
+        );
+        assert_eq!(
+            normalize_base_url_for_compare("http://localhost:11434/v1/"),
+            "http://localhost:11434/v1"
+        );
+        assert_eq!(
+            normalize_base_url_for_compare("HTTP://LOCALHOST:11434/v1"),
+            "http://localhost:11434/v1"
+        );
+    }
+
+    #[test]
+    fn existing_custom_provider_for_base_url_prefers_canonical_name() {
+        let mut existing = HashMap::new();
+        existing.insert("custom-openrouter-ai".into(), ProviderConfig {
+            base_url: Some("https://openrouter.ai/api/v1".into()),
+            ..Default::default()
+        });
+        existing.insert("custom-openrouter-ai-2".into(), ProviderConfig {
+            base_url: Some("https://OPENROUTER.ai/api/v1/".into()),
+            ..Default::default()
+        });
+        existing.insert("custom-together-ai".into(), ProviderConfig {
+            base_url: Some("https://api.together.ai/v1".into()),
+            ..Default::default()
+        });
+
+        assert_eq!(
+            existing_custom_provider_for_base_url("https://openrouter.ai/api/v1", &existing),
+            Some("custom-openrouter-ai".into())
+        );
+        assert_eq!(
+            existing_custom_provider_for_base_url("https://api.together.ai/v1", &existing),
+            Some("custom-together-ai".into())
+        );
+        assert_eq!(
+            existing_custom_provider_for_base_url("https://example.com/v1", &existing),
+            None
+        );
+    }
+
+    #[test]
+    fn key_store_save_config_with_display_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::with_path(dir.path().join("keys.json"));
+
+        store
+            .save_config_with_display_name(
+                "custom-together-ai",
+                Some("sk-test".into()),
+                Some("https://api.together.ai/v1".into()),
+                Some(vec!["meta-llama/Llama-3-70b".into()]),
+                Some("together.ai".into()),
+            )
+            .unwrap();
+
+        let config = store.load_config("custom-together-ai").unwrap();
+        assert_eq!(config.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            config.base_url.as_deref(),
+            Some("https://api.together.ai/v1")
+        );
+        assert_eq!(config.display_name.as_deref(), Some("together.ai"));
+    }
+
+    #[test]
+    fn normalize_model_list_strips_provider_namespace() {
+        let models = normalize_model_list(vec![
+            "openai::gpt-5.2".into(),
+            "custom-openrouter-ai::gpt-5.2".into(),
+            "gpt-5.2".into(),
+            "  anthropic/claude-sonnet-4-5  ".into(),
+        ]);
+        assert_eq!(models, vec!["gpt-5.2", "anthropic/claude-sonnet-4-5"]);
     }
 }

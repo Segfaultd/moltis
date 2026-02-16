@@ -411,7 +411,7 @@ mod tests {
             cancel: tokio_util::sync::CancellationToken::new(),
             message_log: None::<Arc<dyn MessageLog>>,
             event_sink: Some(sink.clone()),
-            otp: std::sync::Mutex::new(OtpState::new(300)),
+            otp: Mutex::new(OtpState::new(300)),
         };
         map.write()
             .unwrap_or_else(|e| e.into_inner())

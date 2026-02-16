@@ -1,5 +1,9 @@
 use std::{
-    collections::HashSet, fs::OpenOptions, io::Write, net::SocketAddr, path::Path as FsPath,
+    collections::{HashMap, HashSet},
+    fs::OpenOptions,
+    io::Write,
+    net::SocketAddr,
+    path::Path as FsPath,
     sync::Arc,
 };
 
@@ -377,6 +381,32 @@ fn browser_container_prefix(instance_slug: &str) -> String {
     format!("moltis-{instance_slug}-browser")
 }
 
+fn env_value_with_overrides(env_overrides: &HashMap<String, String>, key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            env_overrides
+                .get(key)
+                .cloned()
+                .filter(|value| !value.trim().is_empty())
+        })
+}
+
+fn merge_env_overrides(
+    base_overrides: &HashMap<String, String>,
+    additional: Vec<(String, String)>,
+) -> HashMap<String, String> {
+    let mut merged = base_overrides.clone();
+    for (key, value) in additional {
+        if key.trim().is_empty() || value.trim().is_empty() {
+            continue;
+        }
+        merged.entry(key).or_insert(value);
+    }
+    merged
+}
+
 fn log_startup_model_inventory(reg: &ProviderRegistry) {
     let mut model_ids: Vec<String> = reg.list_models().iter().map(|m| m.id.clone()).collect();
     model_ids.sort();
@@ -534,6 +564,27 @@ fn build_api_routes() -> Router<AppState> {
         .route(
             "/api/images/default",
             get(api_get_default_image_handler).put(api_set_default_image_handler),
+        )
+        .route(
+            "/api/sandbox/containers",
+            get(api_list_containers_handler),
+        )
+        .route(
+            "/api/sandbox/containers/clean",
+            axum::routing::post(api_clean_all_containers_handler),
+        )
+        .route(
+            "/api/sandbox/containers/{name}/stop",
+            axum::routing::post(api_stop_container_handler),
+        )
+        .route(
+            "/api/sandbox/containers/{name}",
+            axum::routing::delete(api_remove_container_handler),
+        )
+        .route("/api/sandbox/disk-usage", get(api_disk_usage_handler))
+        .route(
+            "/api/sandbox/daemon/restart",
+            axum::routing::post(api_restart_daemon_handler),
         )
         .route(
             "/api/env",
@@ -744,7 +795,7 @@ pub fn build_gateway_app(
     methods: Arc<MethodRegistry>,
     push_service: Option<Arc<crate::push::PushService>>,
     http_request_logs: bool,
-    webauthn_state: Option<Arc<crate::auth_webauthn::WebAuthnState>>,
+    webauthn_registry: Option<Arc<crate::auth_webauthn::WebAuthnRegistry>>,
 ) -> Router {
     let cors = build_cors_layer();
 
@@ -756,7 +807,7 @@ pub fn build_gateway_app(
     if let Some(ref cred_store) = state.credential_store {
         let auth_state = AuthState {
             credential_store: Arc::clone(cred_store),
-            webauthn_state: webauthn_state.clone(),
+            webauthn_registry: webauthn_registry.clone(),
             gateway_state: Arc::clone(&state),
         };
         router = router.nest("/api/auth", auth_router().with_state(auth_state));
@@ -776,6 +827,10 @@ pub fn build_gateway_app(
 
         router
             .route("/auth/callback", get(oauth_callback_handler))
+            .route(
+                "/share/{share_id}/og-image.svg",
+                get(share_social_image_handler),
+            )
             .route("/share/{share_id}", get(share_page_handler))
             .route("/onboarding", get(onboarding_handler))
             .route("/login", get(login_handler_page))
@@ -807,7 +862,7 @@ pub fn build_gateway_app(
     state: Arc<GatewayState>,
     methods: Arc<MethodRegistry>,
     http_request_logs: bool,
-    webauthn_state: Option<Arc<crate::auth_webauthn::WebAuthnState>>,
+    webauthn_registry: Option<Arc<crate::auth_webauthn::WebAuthnRegistry>>,
 ) -> Router {
     let cors = build_cors_layer();
 
@@ -828,7 +883,7 @@ pub fn build_gateway_app(
     if let Some(ref cred_store) = state.credential_store {
         let auth_state = AuthState {
             credential_store: Arc::clone(cred_store),
-            webauthn_state: webauthn_state.clone(),
+            webauthn_registry: webauthn_registry.clone(),
             gateway_state: Arc::clone(&state),
         };
         router = router.nest("/api/auth", auth_router().with_state(auth_state));
@@ -847,6 +902,10 @@ pub fn build_gateway_app(
 
         router
             .route("/auth/callback", get(oauth_callback_handler))
+            .route(
+                "/share/{share_id}/og-image.svg",
+                get(share_social_image_handler),
+            )
             .route("/share/{share_id}", get(share_page_handler))
             .route("/onboarding", get(onboarding_handler))
             .route("/login", get(login_handler_page))
@@ -954,8 +1013,7 @@ fn log_directory_write_probe(dir: &FsPath) {
 }
 
 fn log_startup_config_storage_diagnostics() {
-    let config_dir =
-        moltis_config::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".moltis"));
+    let config_dir = moltis_config::config_dir().unwrap_or_else(|| PathBuf::from(".moltis"));
     let discovered_config = moltis_config::loader::find_config_file();
     let expected_config = moltis_config::find_or_default_config_path();
     let provider_keys_path = config_dir.join("provider_keys.json");
@@ -1034,8 +1092,8 @@ pub async fn start_gateway(
     port: u16,
     no_tls: bool,
     log_buffer: Option<crate::logs::LogBuffer>,
-    config_dir: Option<std::path::PathBuf>,
-    data_dir: Option<std::path::PathBuf>,
+    config_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
     #[cfg(feature = "tailscale")] tailscale_opts: Option<TailscaleOpts>,
 ) -> anyhow::Result<()> {
     // Apply directory overrides before loading config.
@@ -1056,6 +1114,7 @@ pub async fn start_gateway(
 
     // Load config file (moltis.toml / .yaml / .json) if present.
     let mut config = moltis_config::discover_and_load();
+    let config_env_overrides = config.env.clone();
     let instance_slug_value = instance_slug(&config);
     let browser_container_prefix = browser_container_prefix(&instance_slug_value);
     let sandbox_container_prefix = sandbox_container_prefix(&instance_slug_value);
@@ -1078,15 +1137,19 @@ pub async fn start_gateway(
     let auto_detected_provider_sources = if has_explicit_provider_settings {
         Vec::new()
     } else {
-        crate::provider_setup::detect_auto_provider_sources(
+        crate::provider_setup::detect_auto_provider_sources_with_overrides(
             &config.providers,
             deploy_platform.as_deref(),
+            &config_env_overrides,
         )
     };
 
     // Discover LLM providers from env + config + saved keys.
     let registry = Arc::new(tokio::sync::RwLock::new(
-        ProviderRegistry::from_env_with_config(&effective_providers),
+        ProviderRegistry::from_env_with_config_and_overrides(
+            &effective_providers,
+            &config_env_overrides,
+        ),
     ));
     let (provider_summary, providers_available_at_startup) = {
         let reg = registry.read().await;
@@ -1096,7 +1159,7 @@ pub async fn start_gateway(
     if !providers_available_at_startup {
         let config_path = moltis_config::find_or_default_config_path();
         let provider_keys_path = moltis_config::config_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from(".moltis"))
+            .unwrap_or_else(|| PathBuf::from(".moltis"))
             .join("provider_keys.json");
         warn!(
             provider_summary = %provider_summary,
@@ -1226,9 +1289,12 @@ pub async fn start_gateway(
         Arc::clone(&registry),
         config.providers.clone(),
         deploy_platform.clone(),
-    );
+    )
+    .with_env_overrides(config_env_overrides.clone());
     provider_setup.set_priority_models(live_model_service.priority_models_handle());
-    services.provider_setup = Arc::new(provider_setup);
+    let provider_setup_service = Arc::new(provider_setup);
+    services.provider_setup =
+        Arc::clone(&provider_setup_service) as Arc<dyn crate::services::ProviderSetupService>;
 
     // Wire live MCP service.
     let mcp_configured_count;
@@ -1244,17 +1310,26 @@ pub async fn start_gateway(
                     "sse" => moltis_mcp::registry::TransportType::Sse,
                     _ => moltis_mcp::registry::TransportType::Stdio,
                 };
-                merged.servers.insert(
-                    name.clone(),
-                    moltis_mcp::McpServerConfig {
+                let oauth = entry
+                    .oauth
+                    .as_ref()
+                    .map(|o| moltis_mcp::registry::McpOAuthConfig {
+                        client_id: o.client_id.clone(),
+                        auth_url: o.auth_url.clone(),
+                        token_url: o.token_url.clone(),
+                        scopes: o.scopes.clone(),
+                    });
+                merged
+                    .servers
+                    .insert(name.clone(), moltis_mcp::McpServerConfig {
                         command: entry.command.clone(),
                         args: entry.args.clone(),
                         env: entry.env.clone(),
                         enabled: entry.enabled,
                         transport,
                         url: entry.url.clone(),
-                    },
-                );
+                        oauth,
+                    });
             }
         }
         mcp_configured_count = merged.servers.values().filter(|s| s.enabled).count();
@@ -1285,8 +1360,7 @@ pub async fn start_gateway(
         )
     });
 
-    let config_dir =
-        moltis_config::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".moltis"));
+    let config_dir = moltis_config::config_dir().unwrap_or_else(|| PathBuf::from(".moltis"));
     std::fs::create_dir_all(&config_dir).unwrap_or_else(|e| {
         panic!(
             "failed to create config directory {}: {e}",
@@ -1331,80 +1405,104 @@ pub async fn start_gateway(
             .expect("failed to init credential store"),
     );
 
-    // Initialize WebAuthn state for passkey support.
-    // RP ID: explicit env > PaaS env (DO, Render, Fly, Railway) > "localhost"
-    let rp_id = std::env::var("MOLTIS_WEBAUTHN_RP_ID")
-        .or_else(|_| std::env::var("APP_DOMAIN"))
-        .or_else(|_| std::env::var("RENDER_EXTERNAL_HOSTNAME"))
-        .or_else(|_| std::env::var("FLY_APP_NAME").map(|name| format!("{name}.fly.dev")))
-        .or_else(|_| std::env::var("RAILWAY_PUBLIC_DOMAIN"))
-        .unwrap_or_else(|_| "localhost".into());
+    // Runtime env overrides from the settings UI (`/api/env`) layered after
+    // config `[env]`. Process env remains highest precedence.
+    let runtime_env_overrides = match credential_store.get_all_env_values().await {
+        Ok(db_env_vars) => merge_env_overrides(&config_env_overrides, db_env_vars),
+        Err(error) => {
+            warn!(%error, "failed to load persisted env overrides from credential store");
+            config_env_overrides.clone()
+        },
+    };
+
+    // Initialize WebAuthn registry for passkey support.
+    // Each hostname the user may access from gets its own RP ID + origins entry
+    // so passkeys work from localhost, mDNS hostname, and .local alike.
     let default_scheme = if config.tls.enabled {
         "https"
     } else {
         "http"
     };
-    // Origin: explicit env > PaaS env (DO, Render, Fly) > scheme://rp_id(:port)
-    // PaaS platforms proxy on standard ports, so skip the port when rp_id isn't localhost.
-    let rp_origin_str = std::env::var("MOLTIS_WEBAUTHN_ORIGIN")
+
+    // Explicit RP ID from env (PaaS platforms).
+    let explicit_rp_id = std::env::var("MOLTIS_WEBAUTHN_RP_ID")
+        .or_else(|_| std::env::var("APP_DOMAIN"))
+        .or_else(|_| std::env::var("RENDER_EXTERNAL_HOSTNAME"))
+        .or_else(|_| std::env::var("FLY_APP_NAME").map(|name| format!("{name}.fly.dev")))
+        .or_else(|_| std::env::var("RAILWAY_PUBLIC_DOMAIN"))
+        .ok();
+
+    let explicit_origin = std::env::var("MOLTIS_WEBAUTHN_ORIGIN")
         .or_else(|_| std::env::var("APP_URL"))
         .or_else(|_| std::env::var("RENDER_EXTERNAL_URL"))
-        .unwrap_or_else(|_| {
-            if rp_id == "localhost" {
-                format!("{default_scheme}://{rp_id}:{port}")
-            } else {
-                // PaaS platforms terminate TLS at the proxy, so the browser always
-                // sees https even though the app runs with --no-tls.
-                format!("https://{rp_id}")
+        .ok();
+
+    let webauthn_registry = {
+        let mut registry = crate::auth_webauthn::WebAuthnRegistry::new();
+        let mut any_ok = false;
+
+        // Helper: try to add one RP ID with its origin + extras to the registry.
+        let mut try_add = |rp_id: &str, origin_str: &str, extras: &[webauthn_rs::prelude::Url]| {
+            let Ok(origin_url) = webauthn_rs::prelude::Url::parse(origin_str) else {
+                tracing::warn!("invalid WebAuthn origin URL '{origin_str}'");
+                return;
+            };
+            match crate::auth_webauthn::WebAuthnState::new(rp_id, &origin_url, extras) {
+                Ok(wa) => {
+                    info!(rp_id = %rp_id, origins = ?wa.get_allowed_origins(), "WebAuthn RP registered");
+                    registry.add(rp_id.to_owned(), wa);
+                    any_ok = true;
+                },
+                Err(e) => tracing::warn!(rp_id = %rp_id, "failed to init WebAuthn: {e}"),
             }
-        });
-    // Build extra allowed origins so passkeys work when accessed via mDNS
-    // hostname (e.g. http://m4max.local:18080) in addition to localhost.
-    let mut extra_origins = Vec::new();
-    if rp_id == "localhost"
-        && let Ok(url) =
-            webauthn_rs::prelude::Url::parse(&format!("{default_scheme}://moltis.localhost:{port}"))
-    {
-        extra_origins.push(url);
-    }
-    if let Ok(hn) = hostname::get() {
-        let hn_str = hn.to_string_lossy();
-        if hn_str != rp_id && hn_str != "localhost" {
-            if let Ok(url) =
-                webauthn_rs::prelude::Url::parse(&format!("{default_scheme}://{hn_str}:{port}"))
-            {
-                extra_origins.push(url);
-            }
-            // Also accept the .local mDNS variant if the hostname doesn't
-            // already end with .local.
-            if !hn_str.ends_with(".local")
-                && let Ok(url) = webauthn_rs::prelude::Url::parse(&format!(
-                    "{default_scheme}://{hn_str}.local:{port}"
+        };
+
+        if let Some(ref rp_id) = explicit_rp_id {
+            // PaaS: single explicit RP ID.
+            let origin = explicit_origin
+                .clone()
+                .unwrap_or_else(|| format!("https://{rp_id}"));
+            try_add(rp_id, &origin, &[]);
+        } else {
+            // Local: register localhost + moltis.localhost as extras.
+            let localhost_origin = format!("{default_scheme}://localhost:{port}");
+            let moltis_localhost: Vec<webauthn_rs::prelude::Url> =
+                webauthn_rs::prelude::Url::parse(&format!(
+                    "{default_scheme}://moltis.localhost:{port}"
                 ))
-            {
-                extra_origins.push(url);
+                .into_iter()
+                .collect();
+            try_add("localhost", &localhost_origin, &moltis_localhost);
+
+            // Register system hostname and hostname.local for LAN/mDNS access.
+            if let Ok(hn) = hostname::get() {
+                let hn_str = hn.to_string_lossy();
+                if hn_str != "localhost" {
+                    // hostname.local as RP ID (mDNS access)
+                    let local_name = if hn_str.ends_with(".local") {
+                        hn_str.to_string()
+                    } else {
+                        format!("{hn_str}.local")
+                    };
+                    let local_origin = format!("{default_scheme}://{local_name}:{port}");
+                    try_add(&local_name, &local_origin, &[]);
+
+                    // bare hostname as RP ID (direct LAN access)
+                    let bare = hn_str.strip_suffix(".local").unwrap_or(&hn_str);
+                    if bare != local_name {
+                        let bare_origin = format!("{default_scheme}://{bare}:{port}");
+                        try_add(bare, &bare_origin, &[]);
+                    }
+                }
             }
         }
-    }
 
-    let webauthn_state = match webauthn_rs::prelude::Url::parse(&rp_origin_str) {
-        Ok(rp_origin) => {
-            match crate::auth_webauthn::WebAuthnState::new(&rp_id, &rp_origin, &extra_origins) {
-                Ok(wa) => {
-                    let origins = wa.get_allowed_origins();
-                    info!(rp_id = %rp_id, origins = ?origins, "WebAuthn passkeys enabled");
-                    Some(Arc::new(wa))
-                },
-                Err(e) => {
-                    tracing::warn!("failed to init WebAuthn: {e}");
-                    None
-                },
-            }
-        },
-        Err(e) => {
-            tracing::warn!("invalid WebAuthn origin URL '{rp_origin_str}': {e}");
+        if any_ok {
+            info!(origins = ?registry.get_all_origins(), "WebAuthn passkeys enabled");
+            Some(Arc::new(registry))
+        } else {
             None
-        },
+        }
     };
 
     // If MOLTIS_PASSWORD is set and no password in DB yet, migrate it.
@@ -1422,16 +1520,14 @@ pub async fn start_gateway(
     );
 
     // Migrate from projects.toml if it exists.
-    let config_dir =
-        moltis_config::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".moltis"));
+    let config_dir = moltis_config::config_dir().unwrap_or_else(|| PathBuf::from(".moltis"));
     let projects_toml_path = config_dir.join("projects.toml");
     if projects_toml_path.exists() {
         info!("migrating projects.toml to SQLite");
         let old_store = moltis_projects::TomlProjectStore::new(projects_toml_path.clone());
         let sqlite_store = moltis_projects::SqliteProjectStore::new(db_pool.clone());
         if let Ok(projects) =
-            <moltis_projects::TomlProjectStore as moltis_projects::ProjectStore>::list(&old_store)
-                .await
+            <moltis_projects::TomlProjectStore as ProjectStore>::list(&old_store).await
         {
             for p in projects {
                 if let Err(e) = sqlite_store.upsert(p).await {
@@ -1470,7 +1566,7 @@ pub async fn start_gateway(
     }
 
     // Wire stores.
-    let project_store: Arc<dyn moltis_projects::ProjectStore> =
+    let project_store: Arc<dyn ProjectStore> =
         Arc::new(moltis_projects::SqliteProjectStore::new(db_pool.clone()));
     let session_store = Arc::new(SessionStore::new(sessions_dir));
     let session_metadata = Arc::new(SqliteSessionMetadata::new(db_pool.clone()));
@@ -1632,15 +1728,10 @@ pub async fn start_gateway(
             // Spawn async broadcast in a background task since we're in a sync callback.
             let state = Arc::clone(state);
             tokio::spawn(async move {
-                crate::broadcast::broadcast(
-                    &state,
-                    event,
-                    payload,
-                    crate::broadcast::BroadcastOpts {
-                        drop_if_slow: true,
-                        ..Default::default()
-                    },
-                )
+                broadcast(&state, event, payload, BroadcastOpts {
+                    drop_if_slow: true,
+                    ..Default::default()
+                })
                 .await;
             });
         });
@@ -1688,14 +1779,20 @@ pub async fn start_gateway(
 
         if should_prebuild_sandbox_image(router.mode(), &packages) {
             let deferred_for_build = Arc::clone(&deferred_state);
+            // Mark the build as in-progress so the UI can show a banner
+            // even if the WebSocket broadcast fires before the client connects.
+            sandbox_router
+                .building_flag
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            let build_router = Arc::clone(&sandbox_router);
             tokio::spawn(async move {
                 // Broadcast build start event.
                 if let Some(state) = deferred_for_build.get() {
-                    crate::broadcast::broadcast(
+                    broadcast(
                         state,
                         "sandbox.image.build",
                         serde_json::json!({ "phase": "start", "packages": packages }),
-                        crate::broadcast::BroadcastOpts {
+                        BroadcastOpts {
                             drop_if_slow: true,
                             ..Default::default()
                         },
@@ -1711,9 +1808,12 @@ pub async fn start_gateway(
                             "sandbox image pre-build complete"
                         );
                         router.set_global_image(Some(result.tag.clone())).await;
+                        build_router
+                            .building_flag
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
 
                         if let Some(state) = deferred_for_build.get() {
-                            crate::broadcast::broadcast(
+                            broadcast(
                                 state,
                                 "sandbox.image.build",
                                 serde_json::json!({
@@ -1721,7 +1821,7 @@ pub async fn start_gateway(
                                     "tag": result.tag,
                                     "built": result.built,
                                 }),
-                                crate::broadcast::BroadcastOpts {
+                                BroadcastOpts {
                                     drop_if_slow: true,
                                     ..Default::default()
                                 },
@@ -1733,18 +1833,24 @@ pub async fn start_gateway(
                         debug!(
                             "sandbox image pre-build: no-op (no packages or unsupported backend)"
                         );
+                        build_router
+                            .building_flag
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                     },
                     Err(e) => {
                         tracing::warn!("sandbox image pre-build failed: {e}");
+                        build_router
+                            .building_flag
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                         if let Some(state) = deferred_for_build.get() {
-                            crate::broadcast::broadcast(
+                            broadcast(
                                 state,
                                 "sandbox.image.build",
                                 serde_json::json!({
                                     "phase": "error",
                                     "error": e.to_string(),
                                 }),
-                                crate::broadcast::BroadcastOpts {
+                                BroadcastOpts {
                                     drop_if_slow: true,
                                     ..Default::default()
                                 },
@@ -1835,6 +1941,24 @@ pub async fn start_gateway(
         }
     }
 
+    // Startup GC: remove orphaned session containers from previous runs.
+    // At startup no legitimate sessions exist, so any prefixed containers are stale.
+    if sandbox_router.backend_name() != "none" {
+        let prefix = sandbox_router.config().container_prefix.clone();
+        tokio::spawn(async move {
+            if let Some(prefix) = prefix {
+                match moltis_tools::sandbox::clean_all_containers(&prefix).await {
+                    Ok(0) => {},
+                    Ok(n) => info!(
+                        removed = n,
+                        "startup GC: cleaned orphaned session containers"
+                    ),
+                    Err(e) => debug!("startup GC: container cleanup skipped: {e}"),
+                }
+            }
+        });
+    }
+
     // Pre-pull browser container image if browser is enabled and sandbox mode is available.
     // Browser sandbox mode follows session sandbox mode, so we pre-pull if sandboxing is available.
     // Don't pre-pull if sandbox is disabled (mode = Off).
@@ -1850,14 +1974,14 @@ pub async fn start_gateway(
         tokio::spawn(async move {
             // Broadcast pull start event.
             if let Some(state) = deferred_for_browser.get() {
-                crate::broadcast::broadcast(
+                broadcast(
                     state,
                     "browser.image.pull",
                     serde_json::json!({
                         "phase": "start",
                         "image": sandbox_image,
                     }),
-                    crate::broadcast::BroadcastOpts {
+                    BroadcastOpts {
                         drop_if_slow: true,
                         ..Default::default()
                     },
@@ -1869,14 +1993,14 @@ pub async fn start_gateway(
                 Ok(()) => {
                     info!(image = %sandbox_image, "browser container image ready");
                     if let Some(state) = deferred_for_browser.get() {
-                        crate::broadcast::broadcast(
+                        broadcast(
                             state,
                             "browser.image.pull",
                             serde_json::json!({
                                 "phase": "done",
                                 "image": sandbox_image,
                             }),
-                            crate::broadcast::BroadcastOpts {
+                            BroadcastOpts {
                                 drop_if_slow: true,
                                 ..Default::default()
                             },
@@ -1887,7 +2011,7 @@ pub async fn start_gateway(
                 Err(e) => {
                     tracing::warn!(image = %sandbox_image, error = %e, "browser container image pull failed");
                     if let Some(state) = deferred_for_browser.get() {
-                        crate::broadcast::broadcast(
+                        broadcast(
                             state,
                             "browser.image.pull",
                             serde_json::json!({
@@ -1895,7 +2019,7 @@ pub async fn start_gateway(
                                 "image": sandbox_image,
                                 "error": e.to_string(),
                             }),
-                            crate::broadcast::BroadcastOpts {
+                            BroadcastOpts {
                                 drop_if_slow: true,
                                 ..Default::default()
                             },
@@ -1940,8 +2064,7 @@ pub async fn start_gateway(
 
         // Start channels from config file (these take precedence).
         let tg_accounts = &config.channels.telegram;
-        let mut started: std::collections::HashSet<(String, String)> =
-            std::collections::HashSet::new();
+        let mut started: HashSet<(String, String)> = HashSet::new();
         for (account_id, account_config) in tg_accounts {
             if let Err(e) = tg_plugin
                 .start_account(account_id, account_config.clone())
@@ -2030,7 +2153,7 @@ pub async fn start_gateway(
         }
 
         if !started.is_empty() {
-            info!("{} telegram account(s) started", started.len());
+            info!("{} channel account(s) started", started.len());
         }
 
         // Grab shared outbound before moving tg_plugin into the channel service.
@@ -2068,6 +2191,7 @@ pub async fn start_gateway(
     {
         let mut session_svc =
             LiveSessionService::new(Arc::clone(&session_store), Arc::clone(&session_metadata))
+                .with_tts_service(Arc::clone(&services.tts))
                 .with_share_store(Arc::clone(&session_share_store))
                 .with_sandbox_router(Arc::clone(&sandbox_router))
                 .with_project_store(Arc::clone(&project_store))
@@ -2089,156 +2213,166 @@ pub async fn start_gateway(
 
         let mem_cfg = &config.memory;
 
-        // 1. If user explicitly configured an embedding provider, use it.
-        if let Some(ref provider_name) = mem_cfg.provider {
-            match provider_name.as_str() {
-                "local" => {
-                    // Local GGUF embeddings require the `local-embeddings` feature on moltis-memory.
-                    #[cfg(feature = "local-embeddings")]
-                    {
-                        let cache_dir = mem_cfg
-                            .base_url
-                            .as_ref()
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(
-                                moltis_memory::embeddings_local::LocalGgufEmbeddingProvider::default_cache_dir,
-                            );
-                        match moltis_memory::embeddings_local::LocalGgufEmbeddingProvider::ensure_model(
-                            cache_dir,
-                        )
-                        .await
+        if mem_cfg.disable_rag {
+            info!("memory: RAG disabled via memory.disable_rag=true, using keyword-only search");
+        } else {
+            // 1. If user explicitly configured an embedding provider, use it.
+            if let Some(ref provider_name) = mem_cfg.provider {
+                match provider_name.as_str() {
+                    "local" => {
+                        // Local GGUF embeddings require the `local-embeddings` feature on moltis-memory.
+                        #[cfg(feature = "local-embeddings")]
                         {
-                            Ok(path) => {
-                                match moltis_memory::embeddings_local::LocalGgufEmbeddingProvider::new(
-                                    path,
-                                ) {
-                                    Ok(p) => embedding_providers.push(("local-gguf".into(), Box::new(p))),
-                                    Err(e) => warn!("memory: failed to load local GGUF model: {e}"),
-                                }
-                            },
-                            Err(e) => warn!("memory: failed to ensure local model: {e}"),
+                            let cache_dir = mem_cfg
+                                .base_url
+                                .as_ref()
+                                .map(PathBuf::from)
+                                .unwrap_or_else(
+                                    moltis_memory::embeddings_local::LocalGgufEmbeddingProvider::default_cache_dir,
+                                );
+                            match moltis_memory::embeddings_local::LocalGgufEmbeddingProvider::ensure_model(
+                                cache_dir,
+                            )
+                            .await
+                            {
+                                Ok(path) => {
+                                    match moltis_memory::embeddings_local::LocalGgufEmbeddingProvider::new(
+                                        path,
+                                    ) {
+                                        Ok(p) => embedding_providers.push(("local-gguf".into(), Box::new(p))),
+                                        Err(e) => warn!("memory: failed to load local GGUF model: {e}"),
+                                    }
+                                },
+                                Err(e) => warn!("memory: failed to ensure local model: {e}"),
+                            }
                         }
-                    }
-                    #[cfg(not(feature = "local-embeddings"))]
-                    warn!(
-                        "memory: 'local' embedding provider requires the 'local-embeddings' feature"
-                    );
-                },
-                "ollama" | "custom" | "openai" => {
-                    let base_url = mem_cfg
-                        .base_url
-                        .clone()
-                        .unwrap_or_else(|| match provider_name.as_str() {
-                            "ollama" => "http://localhost:11434".into(),
-                            _ => "https://api.openai.com".into(),
+                        #[cfg(not(feature = "local-embeddings"))]
+                        warn!(
+                            "memory: 'local' embedding provider requires the 'local-embeddings' feature"
+                        );
+                    },
+                    "ollama" | "custom" | "openai" => {
+                        let base_url = mem_cfg.base_url.clone().unwrap_or_else(|| {
+                            match provider_name.as_str() {
+                                "ollama" => "http://localhost:11434".into(),
+                                _ => "https://api.openai.com".into(),
+                            }
                         });
-                    if provider_name == "ollama" {
-                        let model = mem_cfg.model.as_deref().unwrap_or("nomic-embed-text");
-                        ensure_ollama_model(&base_url, model).await;
-                    }
-                    let api_key = mem_cfg
-                        .api_key
-                        .as_ref()
-                        .map(|k| k.expose_secret().clone())
-                        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
-                        .unwrap_or_default();
+                        if provider_name == "ollama" {
+                            let model = mem_cfg.model.as_deref().unwrap_or("nomic-embed-text");
+                            ensure_ollama_model(&base_url, model).await;
+                        }
+                        let api_key = mem_cfg
+                            .api_key
+                            .as_ref()
+                            .map(|k| k.expose_secret().clone())
+                            .or_else(|| {
+                                env_value_with_overrides(&runtime_env_overrides, "OPENAI_API_KEY")
+                            })
+                            .unwrap_or_default();
+                        let mut e =
+                            moltis_memory::embeddings_openai::OpenAiEmbeddingProvider::new(api_key);
+                        if base_url != "https://api.openai.com" {
+                            e = e.with_base_url(base_url);
+                        }
+                        if let Some(ref model) = mem_cfg.model {
+                            // Use a sensible default dims; the API returns the actual dims.
+                            e = e.with_model(model.clone(), 1536);
+                        }
+                        embedding_providers.push((provider_name.clone(), Box::new(e)));
+                    },
+                    other => warn!("memory: unknown embedding provider '{other}'"),
+                }
+            }
+
+            // 2. Auto-detect: try Ollama health check.
+            if embedding_providers.is_empty() {
+                let ollama_ok = reqwest::Client::new()
+                    .get("http://localhost:11434/api/tags")
+                    .timeout(std::time::Duration::from_secs(2))
+                    .send()
+                    .await
+                    .is_ok();
+                if ollama_ok {
+                    ensure_ollama_model("http://localhost:11434", "nomic-embed-text").await;
+                    let e = moltis_memory::embeddings_openai::OpenAiEmbeddingProvider::new(
+                        String::new(),
+                    )
+                    .with_base_url("http://localhost:11434".into())
+                    .with_model("nomic-embed-text".into(), 768);
+                    embedding_providers.push(("ollama".into(), Box::new(e)));
+                    info!("memory: detected Ollama at localhost:11434");
+                }
+            }
+
+            // 3. Auto-detect: try remote API-key providers.
+            const EMBEDDING_CANDIDATES: &[(&str, &str, &str)] = &[
+                ("openai", "OPENAI_API_KEY", "https://api.openai.com"),
+                ("mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
+                (
+                    "openrouter",
+                    "OPENROUTER_API_KEY",
+                    "https://openrouter.ai/api/v1",
+                ),
+                ("groq", "GROQ_API_KEY", "https://api.groq.com/openai"),
+                ("xai", "XAI_API_KEY", "https://api.x.ai"),
+                ("deepseek", "DEEPSEEK_API_KEY", "https://api.deepseek.com"),
+                ("cerebras", "CEREBRAS_API_KEY", "https://api.cerebras.ai/v1"),
+                ("minimax", "MINIMAX_API_KEY", "https://api.minimax.io/v1"),
+                ("moonshot", "MOONSHOT_API_KEY", "https://api.moonshot.ai/v1"),
+                ("venice", "VENICE_API_KEY", "https://api.venice.ai/api/v1"),
+            ];
+
+            for (config_name, env_key, default_base) in EMBEDDING_CANDIDATES {
+                let key = effective_providers
+                    .get(config_name)
+                    .and_then(|e| e.api_key.as_ref().map(|k| k.expose_secret().clone()))
+                    .or_else(|| env_value_with_overrides(&runtime_env_overrides, env_key))
+                    .filter(|k| !k.is_empty());
+                if let Some(api_key) = key {
+                    let base = effective_providers
+                        .get(config_name)
+                        .and_then(|e| e.base_url.clone())
+                        .unwrap_or_else(|| default_base.to_string());
                     let mut e =
                         moltis_memory::embeddings_openai::OpenAiEmbeddingProvider::new(api_key);
-                    if base_url != "https://api.openai.com" {
-                        e = e.with_base_url(base_url);
+                    if base != "https://api.openai.com" {
+                        e = e.with_base_url(base);
                     }
-                    if let Some(ref model) = mem_cfg.model {
-                        // Use a sensible default dims; the API returns the actual dims.
-                        e = e.with_model(model.clone(), 1536);
-                    }
-                    embedding_providers.push((provider_name.clone(), Box::new(e)));
-                },
-                other => warn!("memory: unknown embedding provider '{other}'"),
-            }
-        }
-
-        // 2. Auto-detect: try Ollama health check.
-        if embedding_providers.is_empty() {
-            let ollama_ok = reqwest::Client::new()
-                .get("http://localhost:11434/api/tags")
-                .timeout(std::time::Duration::from_secs(2))
-                .send()
-                .await
-                .is_ok();
-            if ollama_ok {
-                ensure_ollama_model("http://localhost:11434", "nomic-embed-text").await;
-                let e =
-                    moltis_memory::embeddings_openai::OpenAiEmbeddingProvider::new(String::new())
-                        .with_base_url("http://localhost:11434".into())
-                        .with_model("nomic-embed-text".into(), 768);
-                embedding_providers.push(("ollama".into(), Box::new(e)));
-                info!("memory: detected Ollama at localhost:11434");
-            }
-        }
-
-        // 3. Auto-detect: try remote API-key providers.
-        const EMBEDDING_CANDIDATES: &[(&str, &str, &str)] = &[
-            ("openai", "OPENAI_API_KEY", "https://api.openai.com"),
-            ("mistral", "MISTRAL_API_KEY", "https://api.mistral.ai/v1"),
-            (
-                "openrouter",
-                "OPENROUTER_API_KEY",
-                "https://openrouter.ai/api/v1",
-            ),
-            ("groq", "GROQ_API_KEY", "https://api.groq.com/openai"),
-            ("xai", "XAI_API_KEY", "https://api.x.ai"),
-            ("deepseek", "DEEPSEEK_API_KEY", "https://api.deepseek.com"),
-            ("cerebras", "CEREBRAS_API_KEY", "https://api.cerebras.ai/v1"),
-            ("minimax", "MINIMAX_API_KEY", "https://api.minimax.chat/v1"),
-            ("moonshot", "MOONSHOT_API_KEY", "https://api.moonshot.ai/v1"),
-            ("venice", "VENICE_API_KEY", "https://api.venice.ai/api/v1"),
-        ];
-
-        for (config_name, env_key, default_base) in EMBEDDING_CANDIDATES {
-            let key = effective_providers
-                .get(config_name)
-                .and_then(|e| e.api_key.as_ref().map(|k| k.expose_secret().clone()))
-                .or_else(|| std::env::var(env_key).ok())
-                .filter(|k| !k.is_empty());
-            if let Some(api_key) = key {
-                let base = effective_providers
-                    .get(config_name)
-                    .and_then(|e| e.base_url.clone())
-                    .unwrap_or_else(|| default_base.to_string());
-                let mut e = moltis_memory::embeddings_openai::OpenAiEmbeddingProvider::new(api_key);
-                if base != "https://api.openai.com" {
-                    e = e.with_base_url(base);
+                    embedding_providers.push((config_name.to_string(), Box::new(e)));
                 }
-                embedding_providers.push((config_name.to_string(), Box::new(e)));
             }
         }
 
         // Build the final embedder: fallback chain, single provider, or keyword-only.
-        let embedder: Option<Box<dyn moltis_memory::embeddings::EmbeddingProvider>> =
-            if embedding_providers.is_empty() {
-                info!("memory: no embedding provider found, using keyword-only search");
-                None
-            } else {
-                let names: Vec<&str> = embedding_providers
-                    .iter()
-                    .map(|(n, _)| n.as_str())
-                    .collect();
-                if embedding_providers.len() == 1 {
-                    if let Some((name, provider)) = embedding_providers.into_iter().next() {
-                        info!(provider = %name, "memory: using single embedding provider");
-                        Some(provider)
-                    } else {
-                        None
-                    }
+        let embedder: Option<Box<dyn moltis_memory::embeddings::EmbeddingProvider>> = if mem_cfg
+            .disable_rag
+        {
+            None
+        } else if embedding_providers.is_empty() {
+            info!("memory: no embedding provider found, using keyword-only search");
+            None
+        } else {
+            let names: Vec<&str> = embedding_providers
+                .iter()
+                .map(|(n, _)| n.as_str())
+                .collect();
+            if embedding_providers.len() == 1 {
+                if let Some((name, provider)) = embedding_providers.into_iter().next() {
+                    info!(provider = %name, "memory: using single embedding provider");
+                    Some(provider)
                 } else {
-                    info!(providers = ?names, active = names[0], "memory: fallback chain configured");
-                    Some(Box::new(
-                        moltis_memory::embeddings_fallback::FallbackEmbeddingProvider::new(
-                            embedding_providers,
-                        ),
-                    ))
+                    None
                 }
-            };
+            } else {
+                info!(providers = ?names, active = names[0], "memory: fallback chain configured");
+                Some(Box::new(
+                    moltis_memory::embeddings_fallback::FallbackEmbeddingProvider::new(
+                        embedding_providers,
+                    ),
+                ))
+            }
+        };
 
         let memory_db_path = data_dir.join("memory.db");
         let memory_db_url = format!("sqlite:{}?mode=rwc", memory_db_path.display());
@@ -2256,6 +2390,7 @@ pub async fn start_gateway(
 
                     let config = moltis_memory::config::MemoryConfig {
                         db_path: memory_db_path.to_string_lossy().into(),
+                        data_dir: Some(data_dir.clone()),
                         memory_dirs: vec![
                             data_memory_file,
                             data_memory_file_lower,
@@ -2267,11 +2402,22 @@ pub async fn start_gateway(
                     let store = Box::new(moltis_memory::store_sqlite::SqliteMemoryStore::new(
                         memory_pool,
                     ));
+                    // Map file entries to their parent directory so that
+                    // root-level files like MEMORY.md are covered by the
+                    // watcher. Deduplicate via BTreeSet to avoid watching
+                    // the same directory twice.
                     let watch_dirs: Vec<_> = config
                         .memory_dirs
                         .iter()
-                        .filter(|p| p.is_dir())
-                        .cloned()
+                        .map(|p| {
+                            if p.is_dir() {
+                                p.clone()
+                            } else {
+                                p.parent().unwrap_or(p.as_path()).to_path_buf()
+                            }
+                        })
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
                         .collect();
                     let manager = Arc::new(if let Some(embedder) = embedder {
                         moltis_memory::manager::MemoryManager::new(config, store, embedder)
@@ -2511,6 +2657,9 @@ pub async fn start_gateway(
         svc.set_state(Arc::clone(&state));
     }
 
+    // Set the state on provider setup service for validation progress updates.
+    provider_setup_service.set_state(Arc::clone(&state));
+
     // Set the state on model service for broadcasting model update events.
     live_model_service.set_state(Arc::clone(&state));
 
@@ -2545,9 +2694,10 @@ pub async fn start_gateway(
         tool_registry.register(Box::new(process_tool));
         tool_registry.register(Box::new(sandbox_packages_tool));
         tool_registry.register(Box::new(cron_tool));
-        if let Some(t) =
-            moltis_tools::web_search::WebSearchTool::from_config(&config.tools.web.search)
-        {
+        if let Some(t) = moltis_tools::web_search::WebSearchTool::from_config_with_env_overrides(
+            &config.tools.web.search,
+            &runtime_env_overrides,
+        ) {
             tool_registry.register(Box::new(t));
         }
         if let Some(t) = moltis_tools::web_fetch::WebFetchTool::from_config(&config.tools.web.fetch)
@@ -2555,7 +2705,12 @@ pub async fn start_gateway(
             tool_registry.register(Box::new(t));
         }
         if let Some(t) = moltis_tools::browser::BrowserTool::from_config(&config.tools.browser) {
-            tool_registry.register(Box::new(t.with_sandbox_router(Arc::clone(&sandbox_router))));
+            let t = if sandbox_router.backend_name() != "none" {
+                t.with_sandbox_router(Arc::clone(&sandbox_router))
+            } else {
+                t
+            };
+            tool_registry.register(Box::new(t));
         }
 
         // Register memory tools if the memory system is available.
@@ -2564,6 +2719,9 @@ pub async fn start_gateway(
                 Arc::clone(mm),
             )));
             tool_registry.register(Box::new(moltis_memory::tools::MemoryGetTool::new(
+                Arc::clone(mm),
+            )));
+            tool_registry.register(Box::new(moltis_memory::tools::MemorySaveTool::new(
                 Arc::clone(mm),
             )));
         }
@@ -2696,8 +2854,7 @@ pub async fn start_gateway(
     #[cfg(feature = "file-watcher")]
     {
         let search_paths = moltis_skills::discover::FsSkillDiscoverer::default_paths();
-        let watch_dirs: Vec<std::path::PathBuf> =
-            search_paths.into_iter().map(|(p, _)| p).collect();
+        let watch_dirs: Vec<PathBuf> = search_paths.into_iter().map(|(p, _)| p).collect();
         if let Ok((_watcher, mut rx)) = moltis_skills::watcher::SkillWatcher::start(watch_dirs) {
             let watcher_state = Arc::clone(&state);
             tokio::spawn(async move {
@@ -2750,7 +2907,7 @@ pub async fn start_gateway(
         Arc::clone(&methods),
         push_service,
         config.server.http_request_logs,
-        webauthn_state.clone(),
+        webauthn_registry.clone(),
     );
     #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
     #[cfg(not(feature = "push-notifications"))]
@@ -2758,7 +2915,7 @@ pub async fn start_gateway(
         Arc::clone(&state),
         Arc::clone(&methods),
         config.server.http_request_logs,
-        webauthn_state.clone(),
+        webauthn_registry.clone(),
     );
 
     let addr: SocketAddr = format!("{bind}:{port}").parse()?;
@@ -2851,7 +3008,7 @@ pub async fn start_gateway(
     // machine's outbound IP so the printed URL is clickable.
     let display_ip = if addr.ip().is_unspecified() {
         resolve_outbound_ip(addr.ip().is_ipv6())
-            .map(|ip| std::net::SocketAddr::new(ip, port))
+            .map(|ip| SocketAddr::new(ip, port))
             .unwrap_or(addr)
     } else {
         addr
@@ -2865,6 +3022,10 @@ pub async fn start_gateway(
     };
     #[cfg(not(feature = "tls"))]
     let display_host = display_ip.to_string();
+    let passkey_origins = webauthn_registry
+        .as_ref()
+        .map(|registry| registry.get_all_origins())
+        .unwrap_or_default();
     #[cfg_attr(not(feature = "tls"), allow(unused_mut))]
     let mut lines = vec![
         format!("moltis gateway v{}", state.version),
@@ -2879,6 +3040,7 @@ pub async fn start_gateway(
                 "HTTP/1.1"
             },
         ),
+        startup_bind_line(addr),
         format!("{} methods registered", methods.method_names().len()),
         format!("llm: {}", provider_summary),
         format!(
@@ -2907,6 +3069,7 @@ pub async fn start_gateway(
         ),
         format!("data: {}", data_dir.display()),
     ];
+    lines.extend(startup_passkey_origin_lines(&passkey_origins));
     // Hint about Apple Container on macOS when using Docker.
     #[cfg(target_os = "macos")]
     if sandbox_router.backend_name() == "docker" {
@@ -2926,9 +3089,7 @@ pub async fn start_gateway(
     }
     // Display setup code if one was generated.
     if let Some(ref code) = setup_code_display {
-        lines.push(format!(
-            "setup code: {code} (enter this in the browser to set your password)"
-        ));
+        lines.extend(startup_setup_code_lines(code));
     }
     #[cfg(feature = "tls")]
     if tls_active {
@@ -3251,11 +3412,11 @@ pub async fn start_gateway(
                     // Broadcast metrics update to all connected clients.
                     let payload = crate::state::MetricsUpdatePayload { snapshot, point };
                     if let Ok(payload_json) = serde_json::to_value(&payload) {
-                        crate::broadcast::broadcast(
+                        broadcast(
                             &metrics_state,
                             "metrics.update",
                             payload_json,
-                            crate::broadcast::BroadcastOpts {
+                            BroadcastOpts {
                                 drop_if_slow: true,
                                 ..Default::default()
                             },
@@ -3329,15 +3490,10 @@ pub async fn start_gateway(
                                 }),
                             ),
                         };
-                        crate::broadcast::broadcast(
-                            &event_state,
-                            event_name,
-                            payload,
-                            crate::broadcast::BroadcastOpts {
-                                drop_if_slow: true,
-                                ..Default::default()
-                            },
-                        )
+                        broadcast(&event_state, event_name, payload, BroadcastOpts {
+                            drop_if_slow: true,
+                            ..Default::default()
+                        })
                         .await;
                     },
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -3356,15 +3512,10 @@ pub async fn start_gateway(
                 match rx.recv().await {
                     Ok(entry) => {
                         if let Ok(payload) = serde_json::to_value(&entry) {
-                            crate::broadcast::broadcast(
-                                &log_state,
-                                "logs.entry",
-                                payload,
-                                crate::broadcast::BroadcastOpts {
-                                    drop_if_slow: true,
-                                    ..Default::default()
-                                },
-                            )
+                            broadcast(&log_state, "logs.entry", payload, BroadcastOpts {
+                                drop_if_slow: true,
+                                ..Default::default()
+                            })
                             .await;
                         }
                     },
@@ -3560,7 +3711,7 @@ async fn ws_upgrade_handler(
         if !is_same_origin(origin, host) {
             tracing::warn!(origin, host, remote = %addr, "rejected cross-origin WebSocket upgrade");
             return (
-                axum::http::StatusCode::FORBIDDEN,
+                StatusCode::FORBIDDEN,
                 "cross-origin WebSocket connections are not allowed",
             )
                 .into_response();
@@ -3597,10 +3748,7 @@ async fn ws_upgrade_handler(
 }
 
 /// Extract the client IP from proxy headers, falling back to the direct connection address.
-fn extract_ws_client_ip(
-    headers: &axum::http::HeaderMap,
-    conn_addr: std::net::SocketAddr,
-) -> Option<String> {
+fn extract_ws_client_ip(headers: &axum::http::HeaderMap, conn_addr: SocketAddr) -> Option<String> {
     // X-Forwarded-For (may contain multiple IPs — take the leftmost/client IP)
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
         && let Some(first_ip) = xff.split(',').next()
@@ -3704,7 +3852,7 @@ fn is_loopback_host(host: &str) -> bool {
 /// - The TCP source IP is loopback
 pub(crate) fn is_local_connection(
     headers: &axum::http::HeaderMap,
-    remote_addr: std::net::SocketAddr,
+    remote_addr: SocketAddr,
     behind_proxy: bool,
 ) -> bool {
     // Hard override: env var says we're behind a proxy.
@@ -3732,7 +3880,7 @@ pub(crate) fn is_local_connection(
 
 async fn websocket_header_authenticated(
     headers: &axum::http::HeaderMap,
-    credential_store: Option<&Arc<crate::auth::CredentialStore>>,
+    credential_store: Option<&Arc<auth::CredentialStore>>,
     is_local: bool,
 ) -> bool {
     let Some(store) = credential_store else {
@@ -3760,6 +3908,26 @@ fn resolve_outbound_ip(ipv6: bool) -> Option<std::net::IpAddr> {
     let socket = UdpSocket::bind(bind).ok()?;
     socket.connect(target).ok()?;
     Some(socket.local_addr().ok()?.ip())
+}
+
+fn startup_bind_line(addr: SocketAddr) -> String {
+    format!("bind (--bind): {addr}")
+}
+
+fn startup_passkey_origin_lines(origins: &[String]) -> Vec<String> {
+    origins
+        .iter()
+        .map(|origin| format!("passkey origin: {origin}"))
+        .collect()
+}
+
+fn startup_setup_code_lines(code: &str) -> Vec<String> {
+    vec![
+        String::new(),
+        format!("setup code: {code}"),
+        "enter this code to set your password or register a passkey".to_string(),
+        String::new(),
+    ]
 }
 
 /// Check whether a WebSocket `Origin` header matches the request `Host`.
@@ -3850,7 +4018,7 @@ static SPA_ROUTES: SpaRoutes = SpaRoutes {
     onboarding: "/onboarding",
     projects: "/projects",
     skills: "/skills",
-    crons: "/crons",
+    crons: "/settings/crons",
     monitoring: "/monitoring",
 };
 
@@ -3887,6 +4055,8 @@ struct GonData {
     /// Central SPA route definitions so JS can read paths from gon
     /// instead of hardcoding them.
     routes: SpaRoutes,
+    /// Unix epoch (milliseconds) when the server process started.
+    started_at: u64,
 }
 
 /// Sandbox runtime snapshot included in gon data so the settings page
@@ -3897,6 +4067,7 @@ struct SandboxGonInfo {
     backend: String,
     os: &'static str,
     default_image: String,
+    image_building: bool,
 }
 
 /// Memory snapshot included in gon data and tick broadcasts.
@@ -4018,12 +4189,16 @@ async fn build_gon_data(gw: &GatewayState) -> GonData {
             backend: router.backend_name().to_owned(),
             os: std::env::consts::OS,
             default_image: router.default_image().await,
+            image_building: router
+                .building_flag
+                .load(std::sync::atomic::Ordering::Relaxed),
         }
     } else {
         SandboxGonInfo {
             backend: "none".to_owned(),
             os: std::env::consts::OS,
             default_image: moltis_tools::sandbox::DEFAULT_SANDBOX_IMAGE.to_owned(),
+            image_building: false,
         }
     };
 
@@ -4042,6 +4217,7 @@ async fn build_gon_data(gw: &GatewayState) -> GonData {
         update: gw.inner.read().await.update.clone(),
         sandbox,
         routes: SPA_ROUTES.clone(),
+        started_at: *PROCESS_STARTED_AT_MS,
     }
 }
 
@@ -4064,7 +4240,7 @@ async fn build_nav_counts(gw: &GatewayState) -> NavCounts {
         .ok()
         .and_then(|v| {
             v.as_array().map(|arr| {
-                let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+                let mut names: HashSet<&str> = HashSet::new();
                 for m in arr {
                     if let Some(p) = m.get("provider").and_then(|p| p.as_str()) {
                         names.insert(p);
@@ -4146,7 +4322,7 @@ async fn api_gon_handler(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(feature = "web-ui")]
 async fn oauth_callback_handler(
     State(state): State<AppState>,
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let Some(code) = params.get("code") else {
         return (
@@ -4163,16 +4339,29 @@ async fn oauth_callback_handler(
             .into_response();
     };
 
-    match state
+    let completion_params = serde_json::json!({
+        "code": code,
+        "state": oauth_state,
+    });
+
+    let completion = match state
         .gateway
         .services
         .provider_setup
-        .oauth_complete(serde_json::json!({
-            "code": code,
-            "state": oauth_state,
-        }))
+        .oauth_complete(completion_params.clone())
         .await
     {
+        Ok(result) => Ok(result),
+        Err(provider_error) => state
+            .gateway
+            .services
+            .mcp
+            .oauth_complete(completion_params)
+            .await
+            .map_err(|mcp_error| (provider_error, mcp_error)),
+    };
+
+    match completion {
         Ok(_) => {
             let nonce = uuid::Uuid::new_v4().to_string();
             let html = format!(
@@ -4189,8 +4378,12 @@ async fn oauth_callback_handler(
             }
             resp
         },
-        Err(e) => {
-            tracing::warn!(error = %e, "OAuth callback completion failed");
+        Err((provider_error, mcp_error)) => {
+            tracing::warn!(
+                provider_error = %provider_error,
+                mcp_error = %mcp_error,
+                "OAuth callback completion failed"
+            );
             (
                 StatusCode::BAD_REQUEST,
                 Html(
@@ -4301,6 +4494,233 @@ fn build_session_share_meta(
         image_alt,
     }
 }
+
+#[cfg(feature = "web-ui")]
+fn normalize_share_social_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(feature = "web-ui")]
+fn wrap_share_social_line(text: &str, max_chars: usize) -> Vec<String> {
+    if max_chars == 0 {
+        return vec![];
+    }
+
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut current_len = 0usize;
+
+    for raw_word in text.split_whitespace() {
+        let mut word = raw_word.to_string();
+        let mut word_len = word.chars().count();
+        if word_len > max_chars {
+            word = truncate_for_meta(&word, max_chars.saturating_sub(1));
+            word_len = word.chars().count();
+        }
+
+        if current.is_empty() {
+            current.push_str(&word);
+            current_len = word_len;
+            continue;
+        }
+
+        if current_len + 1 + word_len <= max_chars {
+            current.push(' ');
+            current.push_str(&word);
+            current_len += 1 + word_len;
+            continue;
+        }
+
+        lines.push(current);
+        current = word;
+        current_len = word_len;
+    }
+
+    if !current.is_empty() {
+        lines.push(current);
+    }
+
+    lines
+}
+
+#[cfg(feature = "web-ui")]
+fn build_share_social_text_lines(
+    snapshot: &crate::share_store::ShareSnapshot,
+    identity: &moltis_config::ResolvedIdentity,
+    max_chars: usize,
+    max_lines: usize,
+) -> Vec<String> {
+    let user_label = share_user_label(identity);
+    let assistant_label = share_assistant_label(identity);
+    let mut lines = Vec::new();
+    let mut truncated = false;
+
+    for msg in &snapshot.messages {
+        let role = match msg.role {
+            crate::share_store::SharedMessageRole::User => user_label.as_str(),
+            crate::share_store::SharedMessageRole::Assistant => assistant_label.as_str(),
+            crate::share_store::SharedMessageRole::ToolResult => "Tool",
+            crate::share_store::SharedMessageRole::System
+            | crate::share_store::SharedMessageRole::Notice => continue,
+        };
+        let content = normalize_share_social_text(&msg.content);
+        if content.is_empty() {
+            continue;
+        }
+        let snippet = format!("{role}: {content}");
+        let wrapped = wrap_share_social_line(&snippet, max_chars);
+        for line in wrapped {
+            if lines.len() >= max_lines {
+                truncated = true;
+                break;
+            }
+            lines.push(line);
+        }
+        if truncated {
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push("Shared conversation snapshot".to_string());
+    } else if truncated && let Some(last) = lines.last_mut() {
+        *last = truncate_for_meta(last, max_chars.saturating_sub(1));
+    }
+
+    lines
+}
+
+#[cfg(feature = "web-ui")]
+fn escape_svg_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+#[cfg(feature = "web-ui")]
+fn build_share_social_image_svg(
+    snapshot: &crate::share_store::ShareSnapshot,
+    identity: &moltis_config::ResolvedIdentity,
+) -> String {
+    const MAX_CHARS_PER_LINE: usize = 64;
+    const MAX_LINES: usize = 6;
+    const WIDTH: usize = 1200;
+    const HEIGHT: usize = 630;
+
+    let agent_name = identity_name(identity);
+    let session_name = snapshot
+        .session_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Shared session");
+    let title = truncate_for_meta(session_name, 90);
+    let subtitle = format!(
+        "{agent_name} • {} messages • {}",
+        snapshot.cutoff_message_count,
+        human_share_time(snapshot.created_at)
+    );
+    let lines = build_share_social_text_lines(snapshot, identity, MAX_CHARS_PER_LINE, MAX_LINES);
+
+    let mut conversation_lines = String::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let y = 260 + idx * 48;
+        conversation_lines.push_str(&format!(
+            "<text x=\"78\" y=\"{y}\" fill=\"#e5e7eb\" font-size=\"29\" font-family=\"Inter, system-ui, sans-serif\">{}</text>",
+            escape_svg_text(line)
+        ));
+    }
+
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{WIDTH}\" height=\"{HEIGHT}\" viewBox=\"0 0 {WIDTH} {HEIGHT}\">\
+<defs>\
+  <linearGradient id=\"bg\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"1\">\
+    <stop offset=\"0%\" stop-color=\"#0f172a\"/>\
+    <stop offset=\"100%\" stop-color=\"#020617\"/>\
+  </linearGradient>\
+  <linearGradient id=\"accent\" x1=\"0\" y1=\"0\" x2=\"1\" y2=\"0\">\
+    <stop offset=\"0%\" stop-color=\"#22c55e\"/>\
+    <stop offset=\"100%\" stop-color=\"#16a34a\"/>\
+  </linearGradient>\
+  <radialGradient id=\"glow\" cx=\"0\" cy=\"0\" r=\"1\" gradientTransform=\"translate(1120 88) rotate(90) scale(240 300)\">\
+    <stop offset=\"0%\" stop-color=\"#22c55e\" stop-opacity=\"0.2\"/>\
+    <stop offset=\"100%\" stop-color=\"#22c55e\" stop-opacity=\"0\"/>\
+  </radialGradient>\
+  <clipPath id=\"brand-clip\">\
+    <circle cx=\"1080\" cy=\"118\" r=\"50\"/>\
+  </clipPath>\
+</defs>\
+<rect width=\"{WIDTH}\" height=\"{HEIGHT}\" fill=\"url(#bg)\"/>\
+<rect width=\"{WIDTH}\" height=\"{HEIGHT}\" fill=\"url(#glow)\"/>\
+<rect x=\"44\" y=\"40\" width=\"1112\" height=\"550\" rx=\"26\" fill=\"#0b1220\" fill-opacity=\"0.84\" stroke=\"#334155\"/>\
+<rect x=\"74\" y=\"76\" width=\"8\" height=\"112\" rx=\"4\" fill=\"url(#accent)\"/>\
+<circle cx=\"1080\" cy=\"118\" r=\"58\" fill=\"#0f172a\" stroke=\"#334155\" stroke-width=\"2\"/>\
+<image x=\"1030\" y=\"68\" width=\"100\" height=\"100\" href=\"{}\" clip-path=\"url(#brand-clip)\"/>\
+<text x=\"98\" y=\"120\" fill=\"#f8fafc\" font-size=\"46\" font-family=\"Inter, system-ui, sans-serif\" font-weight=\"700\">{}</text>\
+<text x=\"98\" y=\"164\" fill=\"#93c5fd\" font-size=\"25\" font-family=\"Inter, system-ui, sans-serif\">{}</text>\
+<line x1=\"74\" y1=\"210\" x2=\"1126\" y2=\"210\" stroke=\"#334155\" stroke-width=\"1\"/>\
+{}\
+<text x=\"1122\" y=\"584\" text-anchor=\"end\" fill=\"#9ca3af\" font-size=\"22\" font-family=\"Inter, system-ui, sans-serif\">By Moltis</text>\
+</svg>",
+        SHARE_SOCIAL_BRAND_ICON_DATA_URL.as_str(),
+        escape_svg_text(&title),
+        escape_svg_text(&subtitle),
+        conversation_lines
+    )
+}
+
+#[cfg(feature = "web-ui")]
+fn request_origin(headers: &axum::http::HeaderMap, tls_active: bool) -> Option<String> {
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let forwarded_proto = headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| *value == "http" || *value == "https");
+    let scheme = forwarded_proto.unwrap_or(if tls_active {
+        "https"
+    } else {
+        "http"
+    });
+    Some(format!("{scheme}://{host}"))
+}
+
+#[cfg(feature = "web-ui")]
+fn share_social_image_url(
+    headers: &axum::http::HeaderMap,
+    tls_active: bool,
+    share_id: &str,
+) -> String {
+    let path = format!("/share/{share_id}/og-image.svg");
+    match request_origin(headers, tls_active) {
+        Some(origin) => format!("{origin}{path}"),
+        None => path,
+    }
+}
+
+/// Unix epoch (milliseconds) captured once at process startup.
+#[cfg(feature = "web-ui")]
+static PROCESS_STARTED_AT_MS: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+});
+
+#[cfg(feature = "web-ui")]
+static SHARE_SOCIAL_BRAND_ICON_DATA_URL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(include_bytes!("assets/icons/favicon-compact-512.png"));
+        format!("data:image/png;base64,{encoded}")
+    });
 
 #[cfg(feature = "web-ui")]
 fn human_share_time(ts_ms: u64) -> String {
@@ -4461,6 +4881,12 @@ fn map_share_message_views(
                 role_class,
                 role_label,
                 content: msg.content.clone(),
+                reasoning: msg
+                    .reasoning
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned),
                 audio_data_url: msg.audio_data_url.clone(),
                 image_preview_data_url,
                 image_link_data_url,
@@ -4499,6 +4925,7 @@ async fn share_page_handler(
     Query(query): Query<ShareAccessQuery>,
     jar: CookieJar,
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
 ) -> axum::response::Response {
     let Some(ref share_store) = state.gateway.services.session_share_store else {
         return not_found_share_response();
@@ -4586,6 +5013,7 @@ async fn share_page_handler(
         "private"
     };
     let nonce = uuid::Uuid::new_v4().to_string();
+    let share_image_url = share_social_image_url(&headers, state.gateway.tls_active, &share.id);
 
     let template = ShareHtmlTemplate {
         nonce: &nonce,
@@ -4593,7 +5021,7 @@ async fn share_page_handler(
         share_title: &share_meta.title,
         share_description: &share_meta.description,
         share_site_name: &share_meta.site_name,
-        share_image_url: SHARE_IMAGE_URL,
+        share_image_url: &share_image_url,
         share_image_alt: &share_meta.image_alt,
         assistant_name: &assistant_name,
         assistant_emoji: &assistant_emoji,
@@ -4639,6 +5067,85 @@ async fn share_page_handler(
         headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, value);
     }
 
+    response
+}
+
+#[cfg(feature = "web-ui")]
+async fn share_social_image_handler(
+    Path(share_id): Path<String>,
+    Query(query): Query<ShareAccessQuery>,
+    jar: CookieJar,
+    State(state): State<AppState>,
+) -> axum::response::Response {
+    let Some(ref share_store) = state.gateway.services.session_share_store else {
+        return not_found_share_response();
+    };
+
+    let share = match share_store.get_active_by_id(&share_id).await {
+        Ok(Some(share)) => share,
+        Ok(None) => return not_found_share_response(),
+        Err(e) => {
+            warn!(share_id, error = %e, "failed to load shared session for social image");
+            return not_found_share_response();
+        },
+    };
+
+    let cookie_name = share_cookie_name(&share.id);
+    let cookie_access_granted = jar.get(&cookie_name).is_some_and(|cookie| {
+        crate::share_store::ShareStore::verify_access_key(&share, cookie.value())
+    });
+    let query_access_granted = query
+        .k
+        .as_deref()
+        .is_some_and(|key| crate::share_store::ShareStore::verify_access_key(&share, key));
+
+    if share.visibility == crate::share_store::ShareVisibility::Private
+        && !(cookie_access_granted || query_access_granted)
+    {
+        return not_found_share_response();
+    }
+
+    let snapshot: crate::share_store::ShareSnapshot =
+        match serde_json::from_str(&share.snapshot_json) {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                warn!(
+                    share_id,
+                    error = %e,
+                    "failed to parse shared session snapshot for social image"
+                );
+                return not_found_share_response();
+            },
+        };
+
+    let identity = state
+        .gateway
+        .services
+        .onboarding
+        .identity_get()
+        .await
+        .ok()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    let svg = build_share_social_image_svg(&snapshot, &identity);
+
+    let mut response = (StatusCode::OK, svg).into_response();
+    let headers = response.headers_mut();
+    if let Ok(value) = "image/svg+xml".parse() {
+        headers.insert(axum::http::header::CONTENT_TYPE, value);
+    }
+    if let Ok(value) = "no-cache".parse() {
+        headers.insert(axum::http::header::CACHE_CONTROL, value);
+    }
+    if let Ok(value) = "nosniff".parse() {
+        headers.insert(
+            axum::http::header::HeaderName::from_static("x-content-type-options"),
+            value,
+        );
+    }
+    if let Ok(value) = "default-src 'none'; img-src 'self' data:; style-src 'none'; script-src 'none'; object-src 'none'; frame-ancestors 'none'".parse() {
+        headers.insert(axum::http::header::CONTENT_SECURITY_POLICY, value);
+    }
     response
 }
 
@@ -4722,6 +5229,7 @@ struct ShareMessageView {
     role_class: &'static str,
     role_label: String,
     content: String,
+    reasoning: Option<String>,
     audio_data_url: Option<String>,
     image_preview_data_url: Option<String>,
     image_link_data_url: Option<String>,
@@ -5040,10 +5548,10 @@ async fn api_bootstrap_handler(State(state): State<AppState>) -> impl IntoRespon
 async fn api_mcp_handler(State(state): State<AppState>) -> impl IntoResponse {
     let servers = state.gateway.services.mcp.list().await;
     match servers {
-        Ok(val) => axum::Json(val).into_response(),
+        Ok(val) => Json(val).into_response(),
         Err(e) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            axum::Json(serde_json::json!({ "error": e })),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
         )
             .into_response(),
     }
@@ -5053,16 +5561,14 @@ async fn api_mcp_handler(State(state): State<AppState>) -> impl IntoResponse {
 #[cfg(feature = "web-ui")]
 async fn api_hooks_handler(State(state): State<AppState>) -> impl IntoResponse {
     let hooks = state.gateway.inner.read().await;
-    axum::Json(serde_json::json!({ "hooks": hooks.discovered_hooks }))
+    Json(serde_json::json!({ "hooks": hooks.discovered_hooks }))
 }
 
 /// Lightweight skills overview: repo summaries + enabled skills only.
 /// Full skill lists are loaded on-demand via /api/skills/search.
 /// Returns enabled skills from the skills manifest and skill repos.
 #[cfg(feature = "web-ui")]
-fn enabled_from_manifest(
-    path_result: anyhow::Result<std::path::PathBuf>,
-) -> Vec<serde_json::Value> {
+fn enabled_from_manifest(path_result: anyhow::Result<PathBuf>) -> Vec<serde_json::Value> {
     let Ok(path) = path_result else {
         return Vec::new();
     };
@@ -5180,7 +5686,7 @@ async fn api_search_handler(
 
 #[cfg(feature = "web-ui")]
 async fn api_skills_search_handler(
-    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Query(params): Query<HashMap<String, String>>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let source = params.get("source").cloned().unwrap_or_default();
@@ -5197,34 +5703,70 @@ async fn api_skills_search_handler(
     api_search_handler(repos, &source, &query).await
 }
 
-/// List cached tool images.
+/// List cached tool images and sandbox images.
 #[cfg(feature = "web-ui")]
 async fn api_cached_images_handler() -> impl IntoResponse {
     let builder = moltis_tools::image_cache::DockerImageBuilder::new();
-    match builder.list_cached().await {
-        Ok(images) => Json(serde_json::json!({ "images": images })).into_response(),
+    let (cached, sandbox) = tokio::join!(
+        builder.list_cached(),
+        moltis_tools::sandbox::list_sandbox_images(),
+    );
+
+    let mut images: Vec<serde_json::Value> = Vec::new();
+
+    // Skill tool images (moltis-cache/*).
+    match cached {
+        Ok(list) => {
+            for img in list {
+                images.push(serde_json::json!({
+                    "tag": img.tag,
+                    "size": img.size,
+                    "created": img.created,
+                    "kind": "tool",
+                }));
+            }
+        },
         Err(e) => {
-            let msg = e.to_string();
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": msg })),
-            )
-                .into_response()
+            tracing::warn!("failed to list cached tool images: {e}");
         },
     }
+
+    // Sandbox images (*-sandbox:*).
+    match sandbox {
+        Ok(list) => {
+            for img in list {
+                images.push(serde_json::json!({
+                    "tag": img.tag,
+                    "size": img.size,
+                    "created": img.created,
+                    "kind": "sandbox",
+                }));
+            }
+        },
+        Err(e) => {
+            tracing::warn!("failed to list sandbox images: {e}");
+        },
+    }
+
+    Json(serde_json::json!({ "images": images })).into_response()
 }
 
-/// Delete a specific cached tool image.
+/// Delete a specific cached tool image or sandbox image.
 #[cfg(feature = "web-ui")]
 async fn api_delete_cached_image_handler(Path(tag): Path<String>) -> impl IntoResponse {
-    let builder = moltis_tools::image_cache::DockerImageBuilder::new();
-    // The tag comes URL-encoded; the path captures "moltis-cache/skill:hash" as a single segment.
-    let full_tag = if tag.starts_with("moltis-cache/") {
-        tag
+    // Sandbox images (*-sandbox:*) are handled by the sandbox module.
+    let result = if tag.contains("-sandbox:") {
+        moltis_tools::sandbox::remove_sandbox_image(&tag).await
     } else {
-        format!("moltis-cache/{tag}")
+        let builder = moltis_tools::image_cache::DockerImageBuilder::new();
+        let full_tag = if tag.starts_with("moltis-cache/") {
+            tag
+        } else {
+            format!("moltis-cache/{tag}")
+        };
+        builder.remove_cached(&full_tag).await
     };
-    match builder.remove_cached(&full_tag).await {
+    match result {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => {
             let msg = e.to_string();
@@ -5237,21 +5779,30 @@ async fn api_delete_cached_image_handler(Path(tag): Path<String>) -> impl IntoRe
     }
 }
 
-/// Prune all cached tool images.
+/// Prune all cached tool images and sandbox images.
 #[cfg(feature = "web-ui")]
 async fn api_prune_cached_images_handler() -> impl IntoResponse {
     let builder = moltis_tools::image_cache::DockerImageBuilder::new();
-    match builder.prune_all().await {
-        Ok(count) => Json(serde_json::json!({ "pruned": count })).into_response(),
-        Err(e) => {
-            let msg = e.to_string();
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": msg })),
-            )
-                .into_response()
-        },
+    let (tool_result, sandbox_result) = tokio::join!(
+        builder.prune_all(),
+        moltis_tools::sandbox::clean_sandbox_images(),
+    );
+    let mut count = 0;
+    if let Ok(n) = tool_result {
+        count += n;
     }
+    if let Ok(n) = sandbox_result {
+        count += n;
+    }
+    if let (Err(e1), Err(e2)) = (&tool_result, &sandbox_result) {
+        let msg = format!("tool images: {e1}; sandbox images: {e2}");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": msg })),
+        )
+            .into_response();
+    }
+    Json(serde_json::json!({ "pruned": count })).into_response()
 }
 
 /// Check which packages already exist in a base image.
@@ -5349,6 +5900,148 @@ async fn api_set_default_image_handler(
             Json(serde_json::json!({ "error": "no sandbox backend available" })),
         )
             .into_response()
+    }
+}
+
+/// List running/stopped containers managed by moltis.
+#[cfg(feature = "web-ui")]
+async fn api_list_containers_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let prefix = state
+        .gateway
+        .sandbox_router
+        .as_ref()
+        .map(|r| {
+            r.config()
+                .container_prefix
+                .clone()
+                .unwrap_or_else(|| "moltis-sandbox".to_string())
+        })
+        .unwrap_or_else(|| "moltis-sandbox".to_string());
+    match moltis_tools::sandbox::list_running_containers(&prefix).await {
+        Ok(containers) => Json(serde_json::json!({ "containers": containers })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Stop a moltis-managed container by name.
+#[cfg(feature = "web-ui")]
+async fn api_stop_container_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let prefix = state
+        .gateway
+        .sandbox_router
+        .as_ref()
+        .map(|r| {
+            r.config()
+                .container_prefix
+                .clone()
+                .unwrap_or_else(|| "moltis-sandbox".to_string())
+        })
+        .unwrap_or_else(|| "moltis-sandbox".to_string());
+    if !name.starts_with(&prefix) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "container name does not match expected prefix" })),
+        )
+            .into_response();
+    }
+    match moltis_tools::sandbox::stop_container(&name).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Remove a moltis-managed container by name.
+#[cfg(feature = "web-ui")]
+async fn api_remove_container_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let prefix = state
+        .gateway
+        .sandbox_router
+        .as_ref()
+        .map(|r| {
+            r.config()
+                .container_prefix
+                .clone()
+                .unwrap_or_else(|| "moltis-sandbox".to_string())
+        })
+        .unwrap_or_else(|| "moltis-sandbox".to_string());
+    if !name.starts_with(&prefix) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "container name does not match expected prefix" })),
+        )
+            .into_response();
+    }
+    match moltis_tools::sandbox::remove_container(&name).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Remove all moltis-managed containers (stop running ones first).
+#[cfg(feature = "web-ui")]
+async fn api_clean_all_containers_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let prefix = state
+        .gateway
+        .sandbox_router
+        .as_ref()
+        .map(|r| {
+            r.config()
+                .container_prefix
+                .clone()
+                .unwrap_or_else(|| "moltis-sandbox".to_string())
+        })
+        .unwrap_or_else(|| "moltis-sandbox".to_string());
+    match moltis_tools::sandbox::clean_all_containers(&prefix).await {
+        Ok(removed) => Json(serde_json::json!({ "ok": true, "removed": removed })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Get container disk usage from the sandbox backend.
+#[cfg(feature = "web-ui")]
+async fn api_disk_usage_handler() -> impl IntoResponse {
+    match moltis_tools::sandbox::container_disk_usage().await {
+        Ok(usage) => Json(serde_json::json!({ "usage": usage })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Restart the container daemon to clear corrupted state.
+#[cfg(feature = "web-ui")]
+async fn api_restart_daemon_handler() -> impl IntoResponse {
+    match moltis_tools::sandbox::restart_container_daemon().await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
     }
 }
 
@@ -5453,29 +6146,28 @@ static ASSETS: include_dir::Dir = include_dir::include_dir!("$CARGO_MANIFEST_DIR
 /// Set via `MOLTIS_ASSETS_DIR` env var, or auto-detected from the crate source
 /// tree when running via `cargo run`.
 #[cfg(feature = "web-ui")]
-static FS_ASSETS_DIR: std::sync::LazyLock<Option<std::path::PathBuf>> =
-    std::sync::LazyLock::new(|| {
-        use std::path::PathBuf;
+static FS_ASSETS_DIR: std::sync::LazyLock<Option<PathBuf>> = std::sync::LazyLock::new(|| {
+    use std::path::PathBuf;
 
-        // Explicit env var takes precedence
-        if let Ok(dir) = std::env::var("MOLTIS_ASSETS_DIR") {
-            let p = PathBuf::from(dir);
-            if p.is_dir() {
-                info!("Serving assets from filesystem: {}", p.display());
-                return Some(p);
-            }
+    // Explicit env var takes precedence
+    if let Ok(dir) = std::env::var("MOLTIS_ASSETS_DIR") {
+        let p = PathBuf::from(dir);
+        if p.is_dir() {
+            info!("Serving assets from filesystem: {}", p.display());
+            return Some(p);
         }
+    }
 
-        // Auto-detect: works when running from the repo via `cargo run`
-        let cargo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets");
-        if cargo_dir.is_dir() {
-            info!("Serving assets from filesystem: {}", cargo_dir.display());
-            return Some(cargo_dir);
-        }
+    // Auto-detect: works when running from the repo via `cargo run`
+    let cargo_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/assets");
+    if cargo_dir.is_dir() {
+        info!("Serving assets from filesystem: {}", cargo_dir.display());
+        return Some(cargo_dir);
+    }
 
-        info!("Serving assets from embedded binary");
-        None
-    });
+    info!("Serving assets from embedded binary");
+    None
+});
 
 /// Whether we're serving from the filesystem (dev mode) or embedded (release).
 #[cfg(feature = "web-ui")]
@@ -5695,7 +6387,7 @@ fn seed_default_workspace_markdown_files() {
     seed_file_if_missing(data_dir.join("HEARTBEAT.md"), DEFAULT_HEARTBEAT_MD);
 }
 
-fn seed_file_if_missing(path: std::path::PathBuf, content: &str) {
+fn seed_file_if_missing(path: PathBuf, content: &str) {
     if path.exists() {
         return;
     }
@@ -5989,7 +6681,7 @@ Cost guard:
 /// (with `enabled: false`) but are not registered in the registry.
 pub(crate) async fn discover_and_build_hooks(
     disabled: &HashSet<String>,
-    session_store: Option<&Arc<moltis_sessions::store::SessionStore>>,
+    session_store: Option<&Arc<SessionStore>>,
 ) -> (
     Option<Arc<moltis_common::hooks::HookRegistry>>,
     Vec<crate::state::DiscoveredHookInfo>,
@@ -6067,6 +6759,7 @@ pub(crate) async fn discover_and_build_hooks(
                 meta.events.clone(),
                 std::time::Duration::from_secs(meta.timeout),
                 meta.env.clone(),
+                Some(parsed.source_path.clone()),
             );
             registry.register(Arc::new(handler));
         }
@@ -6133,10 +6826,13 @@ pub(crate) async fn discover_and_build_hooks(
     (Some(Arc::new(registry)), info_list)
 }
 
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, unsafe_code)]
 #[cfg(test)]
 mod tests {
-    use {super::*, std::collections::HashSet};
+    use {
+        super::*,
+        std::collections::{HashMap, HashSet},
+    };
 
     #[test]
     fn approval_manager_uses_config_values() {
@@ -6167,7 +6863,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_dir = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
-        let session_store = Arc::new(moltis_sessions::store::SessionStore::new(sessions_dir));
+        let session_store = Arc::new(SessionStore::new(sessions_dir));
 
         let (registry, info) =
             discover_and_build_hooks(&HashSet::new(), Some(&session_store)).await;
@@ -6197,7 +6893,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_dir = tmp.path().join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
-        let session_store = Arc::new(moltis_sessions::store::SessionStore::new(sessions_dir));
+        let session_store = Arc::new(SessionStore::new(sessions_dir));
 
         session_store
             .append(
@@ -6246,7 +6942,7 @@ mod tests {
     async fn websocket_header_auth_accepts_valid_session_cookie() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = Arc::new(
-            crate::auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
+            auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
                 .await
                 .unwrap(),
         );
@@ -6264,7 +6960,7 @@ mod tests {
     async fn websocket_header_auth_accepts_valid_bearer_api_key() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = Arc::new(
-            crate::auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
+            auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
                 .await
                 .unwrap(),
         );
@@ -6285,7 +6981,7 @@ mod tests {
     async fn websocket_header_auth_rejects_missing_credentials_when_setup_complete() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = Arc::new(
-            crate::auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
+            auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
                 .await
                 .unwrap(),
         );
@@ -6306,7 +7002,7 @@ mod tests {
     async fn websocket_header_auth_rejects_local_when_password_set() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
         let store = Arc::new(
-            crate::auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
+            auth::CredentialStore::with_config(pool, &moltis_config::AuthConfig::default())
                 .await
                 .unwrap(),
         );
@@ -6524,6 +7220,84 @@ mod tests {
 
     #[cfg(feature = "web-ui")]
     #[test]
+    fn share_social_image_svg_uses_session_content_and_escapes() {
+        let identity = moltis_config::ResolvedIdentity {
+            name: "Moltis".to_owned(),
+            user_name: Some("Fabien".to_owned()),
+            emoji: Some("🤖".to_owned()),
+            ..Default::default()
+        };
+        let snapshot = crate::share_store::ShareSnapshot {
+            session_key: "main".to_string(),
+            session_label: Some("Release checklist".to_string()),
+            cutoff_message_count: 2,
+            created_at: 1_770_966_600_000,
+            messages: vec![
+                crate::share_store::SharedMessage {
+                    role: crate::share_store::SharedMessageRole::User,
+                    content: "Need to validate <script>alert(1)</script> path".to_string(),
+                    reasoning: None,
+                    audio_data_url: None,
+                    image: None,
+                    image_data_url: None,
+                    map_links: None,
+                    tool_success: None,
+                    tool_name: None,
+                    tool_command: None,
+                    created_at: None,
+                    model: None,
+                    provider: None,
+                },
+                crate::share_store::SharedMessage {
+                    role: crate::share_store::SharedMessageRole::Assistant,
+                    content: "Run tests, then deploy.".to_string(),
+                    reasoning: None,
+                    audio_data_url: None,
+                    image: None,
+                    image_data_url: None,
+                    map_links: None,
+                    tool_success: None,
+                    tool_name: None,
+                    tool_command: None,
+                    created_at: None,
+                    model: None,
+                    provider: None,
+                },
+            ],
+        };
+
+        let svg = build_share_social_image_svg(&snapshot, &identity);
+        assert!(svg.contains("Release checklist"));
+        assert!(svg.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+        assert!(!svg.contains("Need to validate <script>alert(1)</script> path"));
+        assert!(svg.contains("Fabien: Need to validate"));
+        assert!(svg.contains("data:image/png;base64,"));
+        assert!(svg.contains("By Moltis"));
+    }
+
+    #[cfg(feature = "web-ui")]
+    #[test]
+    fn share_social_image_url_prefers_request_origin_and_falls_back_to_relative() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            axum::http::header::HOST,
+            "share.example.com".parse().unwrap(),
+        );
+        headers.insert("x-forwarded-proto", "https".parse().unwrap());
+        assert_eq!(
+            share_social_image_url(&headers, false, "abc123"),
+            "https://share.example.com/share/abc123/og-image.svg"
+        );
+
+        let empty = axum::http::HeaderMap::new();
+        assert_eq!(
+            share_social_image_url(&empty, false, "abc123"),
+            "/share/abc123/og-image.svg"
+        );
+    }
+
+    #[cfg(feature = "web-ui")]
+    #[test]
     fn askama_template_escapes_share_meta_values() {
         let template = IndexHtmlTemplate {
             build_ts: "dev",
@@ -6559,6 +7333,7 @@ mod tests {
             role_class: "assistant",
             role_label: "🤖 Moltis".to_string(),
             content: "Audio response".to_string(),
+            reasoning: Some("Step 1\nStep 2".to_string()),
             audio_data_url: Some("data:audio/ogg;base64,T2dnUw==".to_string()),
             image_preview_data_url: Some("data:image/png;base64,ZmFrZQ==".to_string()),
             image_link_data_url: Some("data:image/png;base64,ZmFrZQ==".to_string()),
@@ -6602,6 +7377,7 @@ mod tests {
         assert!(html.contains("data-theme-val=\"light\""));
         assert!(html.contains("data-theme-val=\"dark\""));
         assert!(html.contains("class=\"share-page-footer\""));
+        assert!(html.contains("margin-bottom: 14px;"));
         assert!(html.contains("Get your AI assistant at"));
         assert!(html.contains("src=\"/assets/icons/icon-96.png\""));
         assert!(!html.contains("data-epoch-ms=\"1770966600000\""));
@@ -6617,6 +7393,8 @@ mod tests {
         assert!(html.contains("src=\"/assets/icons/map-google-maps.svg\""));
         assert!(html.contains("src=\"/assets/icons/map-apple-maps.svg\""));
         assert!(html.contains("src=\"/assets/icons/map-openstreetmap.svg\""));
+        assert!(html.contains("class=\"msg-reasoning\""));
+        assert!(html.contains("Reasoning"));
     }
 
     #[cfg(feature = "web-ui")]
@@ -6637,6 +7415,7 @@ mod tests {
                 crate::share_store::SharedMessage {
                     role: crate::share_store::SharedMessageRole::User,
                     content: "hi".to_string(),
+                    reasoning: None,
                     audio_data_url: None,
                     image: None,
                     image_data_url: None,
@@ -6651,6 +7430,7 @@ mod tests {
                 crate::share_store::SharedMessage {
                     role: crate::share_store::SharedMessageRole::System,
                     content: "system warning".to_string(),
+                    reasoning: None,
                     audio_data_url: None,
                     image: None,
                     image_data_url: None,
@@ -6665,6 +7445,7 @@ mod tests {
                 crate::share_store::SharedMessage {
                     role: crate::share_store::SharedMessageRole::Notice,
                     content: "share boundary".to_string(),
+                    reasoning: None,
                     audio_data_url: None,
                     image: None,
                     image_data_url: None,
@@ -6679,6 +7460,7 @@ mod tests {
                 crate::share_store::SharedMessage {
                     role: crate::share_store::SharedMessageRole::Assistant,
                     content: "hello".to_string(),
+                    reasoning: Some("internal plan".to_string()),
                     audio_data_url: None,
                     image: None,
                     image_data_url: None,
@@ -6697,6 +7479,7 @@ mod tests {
         assert_eq!(views.len(), 2);
         assert_eq!(views[0].role_class, "user");
         assert_eq!(views[1].role_class, "assistant");
+        assert_eq!(views[1].reasoning.as_deref(), Some("internal plan"));
     }
 
     #[cfg(feature = "web-ui")]
@@ -6716,6 +7499,7 @@ mod tests {
             messages: vec![crate::share_store::SharedMessage {
                 role: crate::share_store::SharedMessageRole::ToolResult,
                 content: "Tartine Bakery".to_string(),
+                reasoning: None,
                 audio_data_url: None,
                 image: Some(crate::share_store::SharedImageSet {
                     preview: crate::share_store::SharedImageAsset {
@@ -6785,6 +7569,7 @@ mod tests {
             messages: vec![crate::share_store::SharedMessage {
                 role: crate::share_store::SharedMessageRole::ToolResult,
                 content: "{\n  \"ok\": true\n}".to_string(),
+                reasoning: None,
                 audio_data_url: None,
                 image: None,
                 image_data_url: None,
@@ -6939,14 +7724,43 @@ mod tests {
 
     #[test]
     fn display_host_uses_real_ip_for_unspecified_bind() {
-        let addr: std::net::SocketAddr = "0.0.0.0:9999".parse().unwrap();
+        let addr: SocketAddr = "0.0.0.0:9999".parse().unwrap();
         assert!(addr.ip().is_unspecified());
 
         if let Some(ip) = resolve_outbound_ip(false) {
-            let display = std::net::SocketAddr::new(ip, addr.port());
+            let display = SocketAddr::new(ip, addr.port());
             assert!(!display.ip().is_unspecified());
             assert_eq!(display.port(), 9999);
         }
+    }
+
+    #[test]
+    fn startup_bind_line_includes_bind_flag_and_address() {
+        let addr: SocketAddr = "0.0.0.0:49494".parse().unwrap();
+        assert_eq!(startup_bind_line(addr), "bind (--bind): 0.0.0.0:49494");
+    }
+
+    #[test]
+    fn startup_passkey_origin_lines_emits_clickable_urls() {
+        let lines = startup_passkey_origin_lines(&[
+            "https://localhost:49494".to_string(),
+            "https://m4max.local:49494".to_string(),
+        ]);
+        assert_eq!(lines, vec![
+            "passkey origin: https://localhost:49494",
+            "passkey origin: https://m4max.local:49494",
+        ]);
+    }
+
+    #[test]
+    fn startup_setup_code_lines_adds_spacers() {
+        let lines = startup_setup_code_lines("493413");
+        assert_eq!(lines, vec![
+            "",
+            "setup code: 493413",
+            "enter this code to set your password or register a passkey",
+            "",
+        ]);
     }
 
     // ── is_local_connection / proxy header detection tests ───────────────
@@ -7194,5 +8008,42 @@ mod tests {
         assert!(csp.contains("frame-ancestors 'none'"));
         assert!(csp.contains("object-src 'none'"));
         assert!(csp.contains("connect-src 'self' ws: wss:"));
+    }
+
+    #[test]
+    fn merge_env_overrides_keeps_existing_config_values() {
+        let base = HashMap::from([
+            ("OPENAI_API_KEY".to_string(), "config-openai".to_string()),
+            ("BRAVE_API_KEY".to_string(), "config-brave".to_string()),
+        ]);
+        let merged = merge_env_overrides(&base, vec![
+            ("OPENAI_API_KEY".to_string(), "db-openai".to_string()),
+            (
+                "PERPLEXITY_API_KEY".to_string(),
+                "db-perplexity".to_string(),
+            ),
+        ]);
+        assert_eq!(
+            merged.get("OPENAI_API_KEY").map(String::as_str),
+            Some("config-openai")
+        );
+        assert_eq!(
+            merged.get("PERPLEXITY_API_KEY").map(String::as_str),
+            Some("db-perplexity")
+        );
+        assert_eq!(
+            merged.get("BRAVE_API_KEY").map(String::as_str),
+            Some("config-brave")
+        );
+    }
+
+    #[test]
+    fn env_value_with_overrides_uses_override_when_process_env_missing() {
+        let unique_key = format!("MOLTIS_TEST_LOOKUP_{}", std::process::id());
+        let overrides = HashMap::from([(unique_key.clone(), "override-value".to_string())]);
+        assert_eq!(
+            env_value_with_overrides(&overrides, &unique_key).as_deref(),
+            Some("override-value")
+        );
     }
 }
